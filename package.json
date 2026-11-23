@@ -1,7 +1,7 @@
 {
   "name": "take-my-car",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "TakeMyCar — браузерная 3D-игра в духе GTA 2: вид сверху, город, угон машин, погони.",
   "type": "module",
   "scripts": {

@@ -2,7 +2,7 @@
 description: Архитектор TakeMyCar — проектирует границы модулей, контракты и ревьюит код, не пишет игровую логику
 mode: subagent
 color: "#8e9bb3"
-steps: 40
+steps: 60
 permissions:
   - action: edit
     resource: "*"
