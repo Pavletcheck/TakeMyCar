@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Сборка мира M3 (контракт ARCHITECTURE §3.4): layout + дорожный граф +
+// Сборка мира: авторская карта (assets/maps/city.json) + дорожный граф +
 // стриминг чанков + общий SpatialHash + точки спавна + мини-карта.
 //
 // World — единственный источник положительных id статических коллайдеров
@@ -13,7 +13,9 @@ import { SpatialHash } from '../core/spatialHash';
 import { TUNING } from '../config/tuning';
 import type { WorldConfig } from '../config/world';
 import { ChunkStreamer } from './chunks';
-import { computeLayoutHash, createCityLayout } from './generator';
+import { buildCityLayout, computeLayoutHash, describeLayout } from './cityLayout';
+import type { CityLayout, LayoutInfo } from './cityLayout';
+import type { CityMap } from './mapTypes';
 import { buildSpawnPoints } from './spawn';
 import type { Bounds, Chunk, MinimapData, MinimapTile, RoadGraph, SpawnPoint } from './types';
 
@@ -23,7 +25,7 @@ export interface WorldStats {
   chunksPending: number;
   /** Время последнего сгенерированного чанка, мс. */
   genLastMs: number;
-  /** Максимум времени генерации чанка за сеанс, мс (M3-A-16) — не среднее. */
+  /** Максимум времени генерации чанка за сеанс, мс — не среднее. */
   genMaxMs: number;
   /** Сколько чанков сгенерировано всего. */
   genCount: number;
@@ -43,6 +45,11 @@ export interface WorldOptions {
 }
 
 export interface World {
+  /** Идентификатор карты (`?map=city`). */
+  readonly mapId: string;
+  /** Данные карты, из которых собран мир. */
+  readonly map: CityMap;
+  /** Константа карты: на планировку не влияет, нужна логам и реплеям. */
   readonly seed: number;
   readonly bounds: Bounds;
   readonly chunkSize: number;
@@ -53,12 +60,14 @@ export interface World {
   /** Тайлы мини-карты активных чанков (обновляются при стриминге). */
   readonly minimapTiles: readonly MinimapTile[];
   readonly activeChunks: readonly Chunk[];
-  /** Общий SpatialHash статики; физика читает только его (M3-A-12). */
+  /** Общий SpatialHash статики; физика читает только его. */
   readonly colliders: SpatialHash<Collider>;
   readonly defaultSpawn: SpawnPoint;
   readonly revision: number;
   /** FNV-1a хэш планировки (считается лениво, для ?debug=1). */
   readonly layoutHash: number;
+  /** Счётчики карты: дороги, кварталы, ориентиры, здания, пропсы. */
+  readonly info: LayoutInfo;
   readonly stats: WorldStats;
 
   /** Стриминг; вызывается из фикс. шага не чаще 4 раз в секунду. */
@@ -85,24 +94,76 @@ export interface World {
 
 const SPAWN_CLEAR_RADIUS = 0.6;
 
+/**
+ * Непроходимая вода: полоса коллайдеров вдоль берега.
+ * Мост (kind === 'bridge') вырезает разрыв по Z, чтобы через реку можно было проехать.
+ * Мосты в карте горизонтальные, поэтому разрыв считается по Z.
+ */
+function addWaterBlockers(
+  map: CityMap,
+  hash: SpatialHash<Collider>,
+  streamer: { allocStaticId(): number },
+): void {
+  const bridges = map.roads.filter((road) => road.kind === 'bridge');
+  for (const water of map.water) {
+    let bands: { lo: number; hi: number }[] = [{ lo: water.z - water.hz, hi: water.z + water.hz }];
+    for (const bridge of bridges) {
+      const bridgeZ = bridge.points[0][1];
+      const half = bridge.width / 2 + 1;
+      const next: { lo: number; hi: number }[] = [];
+      for (const band of bands) {
+        if (bridgeZ + half <= band.lo || bridgeZ - half >= band.hi) {
+          next.push(band);
+          continue;
+        }
+        if (band.lo < bridgeZ - half) next.push({ lo: band.lo, hi: bridgeZ - half });
+        if (band.hi > bridgeZ + half) next.push({ lo: bridgeZ + half, hi: band.hi });
+      }
+      bands = next;
+    }
+    for (const band of bands) {
+      const hz = (band.hi - band.lo) / 2;
+      if (hz < 0.5) continue;
+      hash.insert({
+        id: streamer.allocStaticId(),
+        x: water.x,
+        z: (band.lo + band.hi) / 2,
+        hx: water.hx,
+        hz,
+        angle: 0,
+      });
+    }
+  }
+}
+
 function defaultNow(): number {
   return typeof performance === 'undefined' ? Date.now() : performance.now();
 }
 
-export function createWorld(seed: number, config: WorldConfig, options: WorldOptions = {}): World {
-  // `?seed=N` — единственный источник сида: layout, граф, пропсы и вода
-  // строятся от него, а не от константы в app (M3-A-03).
-  const worldConfig: WorldConfig = config.seed === seed ? config : { ...config, seed };
-  const layout = createCityLayout(worldConfig);
+/**
+ * Собирает мир из авторской карты. Планировка фиксирована данными:
+ * одинаковый city.json даёт одинаковый layoutHash при каждом запуске.
+ */
+export function buildWorldFromMap(
+  map: CityMap,
+  config: WorldConfig,
+  options: WorldOptions = {},
+): World {
+  const layout: CityLayout = buildCityLayout(map, config);
   const hash = options.hash ?? new SpatialHash<Collider>(TUNING.spatialCellSize);
   const now = options.now ?? defaultNow;
   const streamer = new ChunkStreamer(layout, hash, now);
   const spawnPoints = buildSpawnPoints(layout);
 
+  // Вода непроходима: постоянные коллайдеры береговой линии.
+  // Мост оставляет разрыв, чтобы через реку можно было проехать.
+  addWaterBlockers(map, hash, streamer);
+
   const minimapTiles: MinimapTile[] = [];
   let tilesRevision = -1;
   let layoutHashCache = 0;
   let layoutHashReady = false;
+  let infoCache: LayoutInfo | null = null;
 
   const stats: WorldStats = {
     chunksLoaded: 0,
@@ -157,10 +218,12 @@ export function createWorld(seed: number, config: WorldConfig, options: WorldOpt
   };
 
   const world: World = {
-    seed: worldConfig.seed,
+    mapId: map.id,
+    map,
+    seed: map.seed,
     bounds: layout.bounds,
     chunkSize: layout.chunkSize,
-    config: worldConfig,
+    config,
     roadGraph: layout.roadGraph,
     minimap: layout.minimap,
     defaultSpawn: layout.defaultSpawn,
@@ -178,6 +241,10 @@ export function createWorld(seed: number, config: WorldConfig, options: WorldOpt
     },
     get layoutHash() {
       return computeHash();
+    },
+    get info() {
+      if (!infoCache) infoCache = describeLayout(layout);
+      return infoCache;
     },
     get stats() {
       refreshStats();

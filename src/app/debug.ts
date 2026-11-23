@@ -32,7 +32,15 @@ export interface DebugFrameStats {
   chunkGenLastMs: number;
   /** Время последнего world.update, мс. */
   worldUpdateMs: number;
-  /** Сид мира текущего запуска. */
+  /** Идентификатор авторской карты (?map=city). */
+  mapId: string;
+  /** Дорог (полилиний) в карте. */
+  roads: number;
+  /** Кварталов в карте. */
+  blocks: number;
+  /** Ориентиров в карте. */
+  landmarks: number;
+  /** Константа карты для логов. */
   seed: number;
   /** FNV-1a хэш планировки (0 — не считался). */
   layoutHash: number;
@@ -57,6 +65,10 @@ export function createDebugStats(): DebugFrameStats {
     chunkGenMaxMs: 0,
     chunkGenLastMs: 0,
     worldUpdateMs: 0,
+    mapId: '',
+    roads: 0,
+    blocks: 0,
+    landmarks: 0,
     seed: 0,
     layoutHash: 0,
     showWorld: false,
@@ -100,6 +112,7 @@ export class DebugOverlay {
     if (stats.showWorld) {
       const hash = stats.layoutHash >>> 0;
       text +=
+        `\nmap ${stats.mapId}   roads ${stats.roads}   blocks ${stats.blocks}   landmarks ${stats.landmarks}` +
         `\nchunks ${stats.chunks}   gen max ${stats.chunkGenMaxMs.toFixed(1)} ms` +
         `   last ${stats.chunkGenLastMs.toFixed(1)} ms   world ${stats.worldUpdateMs.toFixed(2)} ms` +
         `\nseed ${stats.seed}   layout ${hash.toString(16).padStart(8, '0')}`;

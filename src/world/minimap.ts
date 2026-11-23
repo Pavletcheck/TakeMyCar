@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // Данные мини-карты для HUD: дороги, кварталы, парки и вода.
 // Формат векторный (отрезки и прямоугольники), без Three и без DOM.
-// Глобальные данные строятся один раз, тайлы — при активации чанка.
+// Глобальные данные строятся один раз по карте, тайлы — при активации чанка.
 // ---------------------------------------------------------------------------
 
 import type { BlockKind, DistrictId } from '../config/world';
@@ -17,9 +17,10 @@ import type {
 
 /** Минимум, который нужен мини-карте от квартала. */
 export interface MinimapBlockSource {
-  readonly centerX: number;
-  readonly centerZ: number;
-  readonly half: number;
+  readonly x: number;
+  readonly z: number;
+  readonly hx: number;
+  readonly hz: number;
   readonly district: DistrictId;
   readonly kind: BlockKind;
 }
@@ -30,7 +31,6 @@ export function buildMinimap(
   blocks: readonly MinimapBlockSource[],
   graph: RoadGraph,
   water: readonly MinimapRect[],
-  roadWidth: number,
 ): MinimapData {
   const seen = new Set<number>();
   const roads: MinimapRoad[] = [];
@@ -51,7 +51,7 @@ export function buildMinimap(
       z1: a.z,
       x2: b.x,
       z2: b.z,
-      width: roadWidth,
+      width: edge.laneWidth * edge.lanes * 2,
       arterial: edge.arterial,
     });
   }
@@ -61,14 +61,15 @@ export function buildMinimap(
   for (let i = 0; i < blocks.length; i += 1) {
     const block = blocks[i];
     minimapBlocks.push({
-      x: block.centerX,
-      z: block.centerZ,
-      half: block.half,
+      x: block.x,
+      z: block.z,
+      hx: block.hx,
+      hz: block.hz,
       district: block.district,
       kind: block.kind,
     });
     if (block.kind === 'park' || block.kind === 'promenade') {
-      parks.push({ x: block.centerX, z: block.centerZ, hx: block.half, hz: block.half });
+      parks.push({ x: block.x, z: block.z, hx: block.hx, hz: block.hz });
     }
   }
 

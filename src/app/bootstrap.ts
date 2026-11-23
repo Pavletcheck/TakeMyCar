@@ -13,9 +13,10 @@ import { createRng } from '../core/rng';
 import { createCityView } from '../render/cityView';
 import { TUNING } from '../config/tuning';
 import { WORLD } from '../config/world';
+import { DEFAULT_MAP_ID, loadCityMap } from '../world/mapLoader';
 import { serializeRoadGraph } from '../world/roadGraph';
 import type { SpawnPoint } from '../world/types';
-import { createWorld } from '../world/world';
+import { buildWorldFromMap } from '../world/world';
 import { createDebugStats, DebugOverlay } from './debug';
 
 // ---------------------------------------------------------------------------
@@ -76,12 +77,13 @@ interface MoverSpec {
   phase: number;
 }
 
-/** Отладочный API под ?debug=1: детерминизм и бюджеты проверяются числом. */
+/** Отладочный API под ?debug=1: карта, бюджеты и граф проверяются числом. */
 interface TmcDebugApi {
+  readonly mapId: string;
   readonly seed: number;
   readonly layoutHash: number;
   exportRoadGraph(): string;
-  stats(): Record<string, number>;
+  stats(): Record<string, number | string>;
   /** Телепорт машины для проверки районов (набережная, промзона). */
   teleport(x: number, z: number): void;
   carState(): Record<string, number>;
@@ -93,12 +95,6 @@ declare global {
   }
 }
 
-function parseSeed(raw: string | null, fallback: number): number {
-  if (raw === null || raw === '') return fallback;
-  const value = Number.parseInt(raw, 10);
-  return Number.isFinite(value) ? value >>> 0 : fallback;
-}
-
 export function bootstrap(): void {
   const container = document.getElementById('game');
   if (!container) throw new Error('Не найден контейнер #game');
@@ -106,7 +102,10 @@ export function bootstrap(): void {
   const params = new URLSearchParams(window.location.search);
   const debugWorld = params.get('debug') === '1';
   const stressEnabled = params.get('stress') === '1';
-  const seed = parseSeed(params.get('seed'), WORLD.seed);
+  // Планировка авторская и фиксированная: ?seed больше не меняет карту.
+  // ?map=city выбирает файл карты из assets/maps.
+  const map = loadCityMap(params.get('map') ?? DEFAULT_MAP_ID);
+  const seed = map.seed;
 
   const events = new EventBus<GameEvents>();
   const input = new InputMap();
@@ -115,6 +114,7 @@ export function bootstrap(): void {
   const debug = new DebugOverlay(document.getElementById('stats'));
   const frameStats = createDebugStats();
   frameStats.seed = seed;
+  frameStats.mapId = map.id;
   frameStats.showWorld = debugWorld;
   frameStats.stressActive = stressEnabled;
 
@@ -148,8 +148,8 @@ export function bootstrap(): void {
   scene.add(sun.target);
 
   // --- мир ------------------------------------------------------------------
-  // ?seed=N переопределяет сид всего мира: кварталы, граф, пропсы, вода.
-  const world = createWorld(seed, WORLD);
+  // Мир собирается из авторской карты (assets/maps/city.json), а не из сида.
+  const world = buildWorldFromMap(map, WORLD);
   const colliderHash = world.colliders;
   const registry = new EntityRegistry(colliderHash);
   const collisionCandidates: Collider[] = [];
@@ -514,16 +514,31 @@ export function bootstrap(): void {
   if (debugWorld) {
     // layoutHash считается один раз и доступен и в HUD, и в window.__tmc.
     const layoutHash = world.layoutHash;
+    const info = world.info;
     frameStats.layoutHash = layoutHash;
+    frameStats.mapId = world.mapId;
+    frameStats.roads = info.roads;
+    frameStats.blocks = info.blocks;
+    frameStats.landmarks = info.landmarks;
     window.__tmc = {
+      mapId: world.mapId,
       seed,
       layoutHash,
       exportRoadGraph: () => serializeRoadGraph(world.roadGraph),
       stats: () => {
         const stats = world.stats;
         return {
+          mapId: world.mapId,
           seed,
           layoutHash,
+          roads: info.roads,
+          blocks: info.blocks,
+          landmarks: info.landmarks,
+          nodes: info.nodes,
+          edges: info.edges,
+          lights: info.lights,
+          buildings: info.buildings,
+          props: info.props,
           chunks: world.activeChunks.length,
           colliders: stats.colliders,
           genMaxMs: stats.genMaxMs,

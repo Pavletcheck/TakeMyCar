@@ -1,16 +1,17 @@
 // ---------------------------------------------------------------------------
-// Дорожный граф: сетка магистралей и улиц, направленные рёбра, полосы,
-// светофоры, точки спавна машин, проверка связности и JSON-экспорт.
+// Дорожный граф авторской карты: дороги-полилинии разбиваются на отрезки,
+// узлы ставятся на концах и в пересечениях, полосы считаются из ширины.
+// Направленные рёбра, светофоры, точки спавна машин, JSON-экспорт/импорт.
 //
-// Ребро направленное: полосы 0..lanes-1 считаются справа по ходу from → to,
-// lanePoint() — единственный источник геометрии полос (M3-A-28), чтобы
-// трафик M5 не изобретал своё смещение.
+// Геометрия полос отдаётся явно (`laneWidth`, `laneOffsets`, `lanePoint`),
+// чтобы трафик не изобретал своё смещение. Никакой случайности: layout карты
+// фиксирован, поэтому граф всегда одинаков.
 // ---------------------------------------------------------------------------
 
 import type { Vec2 } from '../core/math';
 import { clamp } from '../core/math';
-import type { WorldConfig } from '../config/world';
-import { hash2 } from './hash';
+import { segmentIntersection } from './mapGeometry';
+import type { CityMap } from './mapTypes';
 import type {
   RoadEdge,
   RoadGraph,
@@ -25,8 +26,29 @@ import type {
 const GRAPH_VERSION = 1 as const;
 /** Шаги вдоль ребра, где ставятся точки спавна машин. */
 const SPAWN_T = [0.25, 0.55, 0.8] as const;
+/** Допуск слияния узлов: 5 см, иначе пересечения дают двойные узлы. */
+const NODE_SNAP = 0.05;
+const SPLIT_EPS = 1e-4;
+const MIN_SEGMENT = 0.05;
 
-interface RoadPair {
+interface SourceSegment {
+  road: number;
+  /** Индекс отрезка внутри дороги. */
+  index: number;
+  x1: number;
+  z1: number;
+  x2: number;
+  z2: number;
+  length: number;
+}
+
+interface Split {
+  t: number;
+  x: number;
+  z: number;
+}
+
+interface Pair {
   a: number;
   b: number;
   axis: 0 | 1;
@@ -34,34 +56,8 @@ interface RoadPair {
   speed: number;
   arterial: boolean;
   oneWay: boolean;
-  /** Индекс прямого ребра a → b. */
   forward: number;
-  /** Индекс обратного ребра b → a или -1. */
   reverse: number;
-}
-
-function buildNodes(config: WorldConfig, seed: number): RoadNode[] {
-  const blocks = Math.round(config.sizeMeters / config.blockStep);
-  const lineCount = blocks - 1;
-  if (lineCount < 2) throw new Error('RoadGraph: слишком мало линий сетки');
-  const nodes: RoadNode[] = [];
-  for (let ix = 0; ix < lineCount; ix += 1) {
-    const x = (ix - (lineCount - 1) / 2) * config.blockStep;
-    for (let iz = 0; iz < lineCount; iz += 1) {
-      const z = (iz - (lineCount - 1) / 2) * config.blockStep;
-      // Светофор — пересечение двух магистралей (индексы линий кратны 3).
-      const lights = ix % 3 === 0 && iz % 3 === 0;
-      nodes.push({
-        id: ix * lineCount + iz,
-        x,
-        z,
-        kind: 'cross',
-        lights,
-        lightPhase: lights ? (hash2(seed, ix, iz) % 1000) / 1000 : undefined,
-      });
-    }
-  }
-  return nodes;
 }
 
 function lanePointAt(
@@ -113,6 +109,19 @@ function collectReach(nodeCount: number, edges: readonly RoadEdge[], start: numb
     }
   }
   return { flags, count };
+}
+
+function findCenterNode(nodes: readonly RoadNode[]): number {
+  let best = 0;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < nodes.length; i += 1) {
+    const d = nodes[i].x * nodes[i].x + nodes[i].z * nodes[i].z;
+    if (d < bestDist) {
+      bestDist = d;
+      best = i;
+    }
+  }
+  return best;
 }
 
 function createGraph(seed: number, nodes: RoadNode[], edges: RoadEdge[]): RoadGraph {
@@ -204,19 +213,6 @@ function createGraph(seed: number, nodes: RoadNode[], edges: RoadEdge[]): RoadGr
   return graph;
 }
 
-function findCenterNode(nodes: readonly RoadNode[]): number {
-  let best = 0;
-  let bestDist = Number.POSITIVE_INFINITY;
-  for (let i = 0; i < nodes.length; i += 1) {
-    const d = nodes[i].x * nodes[i].x + nodes[i].z * nodes[i].z;
-    if (d < bestDist) {
-      bestDist = d;
-      best = i;
-    }
-  }
-  return best;
-}
-
 function graphToData(seed: number, nodes: readonly RoadNode[], edges: readonly RoadEdge[]): RoadGraphData {
   const nodeData: RoadGraphNodeData[] = [];
   for (let i = 0; i < nodes.length; i += 1) {
@@ -246,111 +242,195 @@ function graphToData(seed: number, nodes: readonly RoadNode[], edges: readonly R
   return { version: GRAPH_VERSION, seed, nodes: nodeData, edges: edgeData };
 }
 
-/**
- * Строит граф по конфигу мира. Детерминирован от seed:
- * магистрали — каждая третья линия, односторонние улицы — по хэшу,
- * связность после генерации чинится добавлением обратных рёбер.
- */
-export function buildRoadGraph(seed: number, config: WorldConfig): RoadGraph {
-  const nodes = buildNodes(config, seed);
-  const blocks = Math.round(config.sizeMeters / config.blockStep);
-  const lineCount = blocks - 1;
-  const edges: RoadEdge[] = [];
-  const pairs: RoadPair[] = [];
-
-  const pushEdge = (
-    from: number,
-    to: number,
-    lanes: number,
-    speed: number,
-    oneWay: boolean,
-    arterial: boolean,
-    axis: 0 | 1,
-  ): number => {
-    const a = nodes[from];
-    const b = nodes[to];
-    const dx = b.x - a.x;
-    const dz = b.z - a.z;
-    const length = Math.hypot(dx, dz);
-    const laneWidth = config.laneWidth;
-    const laneOffsets: number[] = new Array(lanes);
-    for (let i = 0; i < lanes; i += 1) laneOffsets[i] = laneWidth * (i + 0.5);
-    edges.push({
-      from,
-      to,
-      lanes,
-      speed,
-      oneWay,
-      arterial,
-      axis,
-      length,
-      laneWidth,
-      laneOffsets,
-      heading: length > 1e-6 ? Math.atan2(dx, dz) : 0,
-    });
-    return edges.length - 1;
-  };
-
-  const connect = (a: number, b: number, axis: 0 | 1, lineIndex: number): void => {
-    const arterial = lineIndex % 3 === 0;
-    const lanes = arterial ? 2 : 1;
-    const speed = arterial ? 16 : 11;
-    const oneWay =
-      !arterial && (axis === 0 ? hash2(seed, lineIndex, 0x51) : hash2(seed, lineIndex, 0x7a)) % 100 < 14;
-    const forward = pushEdge(a, b, lanes, speed, oneWay, arterial, axis);
-    const reverse = oneWay ? -1 : pushEdge(b, a, lanes, speed, false, arterial, axis);
-    pairs.push({ a, b, axis, lanes, speed, arterial, oneWay, forward, reverse });
-  };
-
-  for (let ix = 0; ix < lineCount; ix += 1) {
-    for (let iz = 0; iz < lineCount; iz += 1) {
-      const node = ix * lineCount + iz;
-      // Ребро вдоль X: класс дороги задаёт линия Z (iz).
-      if (ix + 1 < lineCount) connect(node, node + lineCount, 0, iz);
-      // Ребро вдоль Z: класс дороги задаёт линия X (ix).
-      if (iz + 1 < lineCount) connect(node, node + 1, 1, ix);
-    }
-  }
-
-  // --- связность: добавляем обратные рёбра, пока все узлы не достижимы ------
-  const center = findCenterNode(nodes);
-  for (let pass = 0; pass < 6; pass += 1) {
-    const reach = collectReach(nodes.length, edges, center);
-    if (reach.count === nodes.length) break;
-    let changed = false;
-    for (let i = 0; i < pairs.length; i += 1) {
-      const pair = pairs[i];
-      if (!pair.oneWay || pair.reverse >= 0) continue;
-      const aReach = reach.flags[pair.a] === 1;
-      const bReach = reach.flags[pair.b] === 1;
-      if (aReach === bReach) continue;
-      // Обратное ребро нужно со стороны достижимого узла к недостижимому.
-      if (bReach) {
-        pair.reverse = pushEdge(pair.b, pair.a, pair.lanes, pair.speed, false, pair.arterial, pair.axis);
-      } else {
-        pair.reverse = pushEdge(pair.a, pair.b, pair.lanes, pair.speed, false, pair.arterial, pair.axis);
+/** Отрезки всех дорог карты: по ним считаются пересечения и раскладка. */
+function collectSegments(map: CityMap): SourceSegment[] {
+  const segments: SourceSegment[] = [];
+  for (let r = 0; r < map.roads.length; r += 1) {
+    const points = map.roads[r].points;
+    for (let i = 0; i + 1 < points.length; i += 1) {
+      const [x1, z1] = points[i];
+      const [x2, z2] = points[i + 1];
+      const length = Math.hypot(x2 - x1, z2 - z1);
+      if (length < MIN_SEGMENT) {
+        throw new Error(`RoadGraph: у дороги "${map.roads[r].id}" нулевой отрезок #${i}`);
       }
-      edges[pair.forward].oneWay = false;
-      pair.oneWay = false;
-      changed = true;
+      segments.push({ road: r, index: i, x1, z1, x2, z2, length });
     }
-    if (!changed) break;
+  }
+  return segments;
+}
+
+/**
+ * Строит дорожный граф из дорог карты: пересечения дробят отрезки,
+ * общие точки сливаются в один узел, полосы берутся из ширины дороги.
+ */
+export function buildRoadGraphFromMap(map: CityMap): RoadGraph {
+  const segments = collectSegments(map);
+  const splits: Split[][] = segments.map((segment) => [
+    { t: 0, x: segment.x1, z: segment.z1 },
+    { t: 1, x: segment.x2, z: segment.z2 },
+  ]);
+
+  // Пересечения: добавляем точку раскола в оба отрезка.
+  for (let i = 0; i < segments.length; i += 1) {
+    const a = segments[i];
+    for (let j = i + 1; j < segments.length; j += 1) {
+      const b = segments[j];
+      if (a.road === b.road && Math.abs(a.index - b.index) <= 1) continue;
+      const hit = segmentIntersection(a.x1, a.z1, a.x2, a.z2, b.x1, b.z1, b.x2, b.z2);
+      if (!hit) continue;
+      splits[i].push({ t: hit.t, x: hit.x, z: hit.z });
+      splits[j].push({ t: hit.u, x: hit.x, z: hit.z });
+    }
   }
 
-  // Страховка: если после починки граф всё ещё не связен — снимаем oneWay
-  // со всех оставшихся односторонних пар (сетка тогда связна по построению).
-  const finalReach = collectReach(nodes.length, edges, center);
-  if (finalReach.count !== nodes.length) {
+  const nodes: RoadNode[] = [];
+  const nodeByKey = new Map<string, number>();
+  const nodeIndex = (x: number, z: number): number => {
+    const key = `${Math.round(x / NODE_SNAP)}:${Math.round(z / NODE_SNAP)}`;
+    const existing = nodeByKey.get(key);
+    if (existing !== undefined) return existing;
+    const id = nodes.length;
+    nodes.push({ id, x, z, kind: 'cross' });
+    nodeByKey.set(key, id);
+    return id;
+  };
+
+  const edges: RoadEdge[] = [];
+  const pairs: Pair[] = [];
+
+  for (let s = 0; s < segments.length; s += 1) {
+    const road = map.roads[segments[s].road];
+    const points = splits[s];
+    points.sort((lhs, rhs) => lhs.t - rhs.t);
+    const unique: Split[] = [];
+    for (let i = 0; i < points.length; i += 1) {
+      const last = unique[unique.length - 1];
+      if (last && Math.abs(points[i].t - last.t) < SPLIT_EPS) continue;
+      unique.push(points[i]);
+    }
+
+    const laneWidth = road.width / (road.lanes * 2);
+    const laneOffsets: number[] = new Array(road.lanes);
+    for (let i = 0; i < road.lanes; i += 1) laneOffsets[i] = laneWidth * (i + 0.5);
+
+    for (let i = 0; i + 1 < unique.length; i += 1) {
+      const p0 = unique[i];
+      const p1 = unique[i + 1];
+      const from = nodeIndex(p0.x, p0.z);
+      const to = nodeIndex(p1.x, p1.z);
+      if (from === to) continue;
+      const dx = p1.x - p0.x;
+      const dz = p1.z - p0.z;
+      const length = Math.hypot(dx, dz);
+      if (length < MIN_SEGMENT) continue;
+      const heading = Math.atan2(dx, dz);
+      const axis: 0 | 1 = Math.abs(dx) >= Math.abs(dz) ? 0 : 1;
+      const forward = edges.length;
+      edges.push({
+        from,
+        to,
+        lanes: road.lanes,
+        speed: road.speed,
+        oneWay: road.oneWay,
+        arterial: road.arterial,
+        axis,
+        length,
+        laneWidth,
+        laneOffsets,
+        heading,
+      });
+      let reverse = -1;
+      if (!road.oneWay) {
+        reverse = edges.length;
+        edges.push({
+          from: to,
+          to: from,
+          lanes: road.lanes,
+          speed: road.speed,
+          oneWay: false,
+          arterial: road.arterial,
+          axis,
+          length,
+          laneWidth,
+          laneOffsets,
+          heading: Math.atan2(-dx, -dz),
+        });
+      }
+      pairs.push({
+        a: from,
+        b: to,
+        axis,
+        lanes: road.lanes,
+        speed: road.speed,
+        arterial: road.arterial,
+        oneWay: road.oneWay,
+        forward,
+        reverse,
+      });
+    }
+  }
+
+  // Степень узлов и светофоры: на перекрёстке с магистралью.
+  const neighbours: Set<number>[] = new Array(nodes.length);
+  const arterialEdges = new Int32Array(nodes.length);
+  for (let i = 0; i < nodes.length; i += 1) neighbours[i] = new Set<number>();
+  for (let i = 0; i < edges.length; i += 1) {
+    const edge = edges[i];
+    neighbours[edge.from].add(edge.to);
+    neighbours[edge.to].add(edge.from);
+    if (edge.arterial) {
+      arterialEdges[edge.from] += 1;
+      arterialEdges[edge.to] += 1;
+    }
+  }
+  for (let i = 0; i < nodes.length; i += 1) {
+    const node = nodes[i];
+    const degree = neighbours[i].size;
+    node.kind = degree <= 1 ? 'dead' : degree === 3 ? 't' : 'cross';
+    const lights = degree >= 3 && arterialEdges[i] >= 2;
+    node.lights = lights;
+    node.lightPhase = lights
+      ? ((Math.abs(Math.round(node.x)) * 7 + Math.abs(Math.round(node.z)) * 13) % 1000) / 1000
+      : undefined;
+  }
+
+  // Односторонние улицы не должны рвать направленную связность: если после
+  // раскладки часть узлов недостижима, пара становится двусторонней.
+  const center = findCenterNode(nodes);
+  let reach = collectReach(nodes.length, edges, center);
+  if (reach.count !== nodes.length) {
     for (let i = 0; i < pairs.length; i += 1) {
       const pair = pairs[i];
-      if (!pair.oneWay || pair.reverse >= 0) continue;
-      pair.reverse = pushEdge(pair.b, pair.a, pair.lanes, pair.speed, false, pair.arterial, pair.axis);
-      edges[pair.forward].oneWay = false;
+      if (!pair.oneWay) continue;
+      const edge = edges[pair.forward];
+      edge.oneWay = false;
+      edges.push({
+        from: edge.to,
+        to: edge.from,
+        lanes: edge.lanes,
+        speed: edge.speed,
+        oneWay: false,
+        arterial: edge.arterial,
+        axis: edge.axis,
+        length: edge.length,
+        laneWidth: edge.laneWidth,
+        laneOffsets: edge.laneOffsets,
+        heading: Math.atan2(
+          nodes[edge.from].x - nodes[edge.to].x,
+          nodes[edge.from].z - nodes[edge.to].z,
+        ),
+      });
       pair.oneWay = false;
+      pair.reverse = edges.length - 1;
+    }
+    reach = collectReach(nodes.length, edges, center);
+    if (reach.count !== nodes.length) {
+      throw new Error('RoadGraph: карта дала несвязный граф — проверьте дороги');
     }
   }
 
-  return createGraph(seed, nodes, edges);
+  return createGraph(map.seed, nodes, edges);
 }
 
 /** Сериализация графа в JSON-строку (отладка, реплеи, фикстуры). */

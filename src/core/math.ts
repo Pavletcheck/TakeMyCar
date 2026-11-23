@@ -217,21 +217,22 @@ export function rectRectContact(a: Rect, b: Rect, contact: Contact): boolean {
     let uz: number;
     if (axis === 0) {
       ux = ac;
-      uz = as;
+      uz = -as;
     } else if (axis === 1) {
-      ux = -as;
+      ux = as;
       uz = ac;
     } else if (axis === 2) {
       ux = bc;
-      uz = bs;
+      uz = -bs;
     } else {
-      ux = -bs;
+      ux = bs;
       uz = bc;
     }
 
     const projected = dx * ux + dz * uz;
-    const radiusA = a.hx * Math.abs(ac * ux + as * uz) + a.hz * Math.abs(-as * ux + ac * uz);
-    const radiusB = b.hx * Math.abs(bc * ux + bs * uz) + b.hz * Math.abs(-bs * ux + bc * uz);
+    // Оси прямоугольника при rotation.y: local X = (cos, -sin), local Z = (sin, cos).
+    const radiusA = a.hx * Math.abs(ac * ux - as * uz) + a.hz * Math.abs(as * ux + ac * uz);
+    const radiusB = b.hx * Math.abs(bc * ux - bs * uz) + b.hz * Math.abs(bs * ux + bc * uz);
     const overlap = radiusA + radiusB - Math.abs(projected);
 
     if (overlap < 0) return false;

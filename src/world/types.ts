@@ -176,7 +176,10 @@ export interface MinimapRoad {
 export interface MinimapBlock {
   x: number;
   z: number;
-  half: number;
+  /** Половина стороны по X (кварталы не квадратные: набережная, доки). */
+  hx: number;
+  /** Половина стороны по Z. */
+  hz: number;
   district: DistrictId;
   kind: BlockKind;
 }

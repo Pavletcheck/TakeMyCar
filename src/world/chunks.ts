@@ -2,18 +2,21 @@
 // Стриминг чанков 128 м: генерация вокруг игрока, выгрузка далёких.
 // Коллайдеры чанка живут в общем SpatialHash; при выгрузке снимаются ровно
 // свои объекты (remove по тому же Collider), поэтому size возвращается к
-// исходному значению после круга по миру (M3-A-06/07, CH-03…CH-06).
+// исходному значению после круга по миру.
 // id статических коллайдеров выдаёт единый аллокатор мира, начиная с 1;
 // динамические id отрицательные (registry) — пересечения нет.
+//
+// Содержимое чанка берётся из данных карты: кварталы раскрываются префабами,
+// пропсы вне кварталов (набережная, мост) уже разложены по чанкам в layout.
 // ---------------------------------------------------------------------------
 
 import type { Collider } from '../core/math';
 import type { SpatialHash } from '../core/spatialHash';
 import type { DistrictId } from '../config/world';
 import { chunkCoordOf, chunkKey, chunkXOf, chunkZOf } from './coords';
-import { clearBlockContent, createBlockContent, generateBlock } from './generator';
-import type { CityLayout } from './generator';
+import type { CityLayout } from './cityLayout';
 import { buildMinimapTile } from './minimap';
+import { clearBlockContent, createBlockContent, expandPrefab, plateColorOf } from './prefab';
 import type {
   BuildingInstance,
   Chunk,
@@ -34,7 +37,7 @@ export interface ChunkStreamerStats {
   revision: number;
 }
 
-/** Сгенерировать чанк: содержимое кварталов, id коллайдеров, мини-карта. */
+/** Сгенерировать чанк: содержимое кварталов, пропсы, id коллайдеров, мини-карта. */
 export function generateChunk(
   layout: CityLayout,
   cx: number,
@@ -54,13 +57,25 @@ export function generateChunk(
   if (blockIndices) {
     for (let i = 0; i < blockIndices.length; i += 1) {
       const block = layout.blocks[blockIndices[i]];
+      const prefab = layout.prefabs.get(block.prefab);
+      if (!prefab) continue;
       clearBlockContent(content);
-      generateBlock(layout, block, content);
+      expandPrefab(prefab, block, prefab.plate ?? plateColorOf(block.kind, layout.config), content);
       for (let p = 0; p < content.plates.length; p += 1) plates.push(content.plates[p]);
       for (let b = 0; b < content.buildings.length; b += 1) buildings.push(content.buildings[b]);
       for (let p = 0; p < content.props.length; p += 1) props.push(content.props[p]);
       for (let c = 0; c < content.colliders.length; c += 1) colliders.push(content.colliders[c]);
     }
+  }
+
+  // Пропсы вне кварталов: готовые экземпляры из layout, коллайдеры — шаблоны.
+  const extraProps = layout.chunkProps.get(key);
+  if (extraProps) {
+    for (let i = 0; i < extraProps.length; i += 1) props.push(extraProps[i]);
+  }
+  const extraColliders = layout.chunkPropColliders.get(key);
+  if (extraColliders) {
+    for (let i = 0; i < extraColliders.length; i += 1) colliders.push(extraColliders[i]);
   }
 
   for (let i = 0; i < colliders.length; i += 1) colliders[i].id = allocId();
