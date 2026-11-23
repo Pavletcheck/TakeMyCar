@@ -10,26 +10,23 @@ import type { Collider, Contact, Rect } from '../core/math';
 import { EntityRegistry } from '../core/registry';
 import type { EntityId } from '../core/registry';
 import { createRng } from '../core/rng';
-import { SpatialHash } from '../core/spatialHash';
+import { createCityView } from '../render/cityView';
 import { TUNING } from '../config/tuning';
+import { WORLD } from '../config/world';
+import { serializeRoadGraph } from '../world/roadGraph';
+import type { SpawnPoint } from '../world/types';
+import { createWorld } from '../world/world';
 import { createDebugStats, DebugOverlay } from './debug';
 
 // ---------------------------------------------------------------------------
-// M1/M2. Bootstrap: рендерер, сцена, город 5×5, машина и игровой цикл.
-// Three.js живёт только в этом файле; core-модули о сцене не знают.
-// M2: реестр сущностей, решатель с итерациями и стресс-режим 300+50.
+// M3. Композиционный корень: рендер/сцена, мир (createWorld + cityView),
+// машина, камера, цикл и отладка. Three.js живёт только здесь и в render/**.
+// Город больше не строится инлайном: данные — src/world/**, меши — cityView.
 // ---------------------------------------------------------------------------
 
-const BLOCK_STEP = 32; // расстояние между центрами кварталов
-const BLOCK_HALF = 11; // половина плиты квартала
-const GRID = 2; // кварталы от -2 до 2
-const BOUND = GRID * BLOCK_STEP + BLOCK_HALF;
-const CITY_SEED = 20261123;
-const STRESS_SEED = 0x5157e55;
+const STREAM_INTERVAL = 0.25;
 
 const CAR_RADIUS = 1.8;
-const CAR_SPAWN_X = 16;
-const CAR_SPAWN_Z = 2;
 
 const CAR_TUNING = {
   accel: 22,
@@ -41,14 +38,16 @@ const CAR_TUNING = {
   handbrakeGrip: 0.8,
 } as const;
 
-const VIEW_HEIGHT = 62;
-const CAMERA_HEIGHT = 72;
-const CAMERA_BACK_OFFSET = 40;
+const VIEW_HEIGHT = 110;
+const CAMERA_HEIGHT = 130;
+const CAMERA_BACK_OFFSET = 62;
 const CAMERA_DAMP = 6;
 const CAMERA_LOOK_AHEAD = 0.3;
 const CAMERA_MAX_LOOK_AHEAD = 5;
 
-// Стресс-режим: низкие кубы на дорогах, один InstancedMesh на все тела.
+// Стресс-режим ?stress=1: 300 статических + 50 движущихся тел вокруг спавна.
+const STRESS_SEED = 0x5157e55;
+const STRESS_RADIUS = 150;
 const STRESS_STATIC_HALF_MIN = 0.4;
 const STRESS_STATIC_HALF_MAX = 1.2;
 const STRESS_STATIC_HEIGHT = 0.7;
@@ -65,23 +64,11 @@ interface GameEvents extends Record<string, unknown> {
   pause: { paused: boolean };
 }
 
-interface Building {
-  x: number;
-  z: number;
-  w: number;
-  d: number;
-  h: number;
-  color: number;
-}
-
-/** Движущийся коллайдер стресс-режима: кинематика по синусу/кругу. */
+/** Движущийся коллайдер стресс-режима: кинематика по синусу. */
 interface MoverSpec {
   id: EntityId;
-  /** Индекс инстанса в InstancedMesh. */
   handle: number;
-  /** 0 — движение вдоль X, 1 — вдоль Z. */
   axis: 0 | 1;
-  /** Фиксированная координата поперёк движения (дорога). */
   lane: number;
   center: number;
   amplitude: number;
@@ -89,9 +76,37 @@ interface MoverSpec {
   phase: number;
 }
 
+/** Отладочный API под ?debug=1: детерминизм и бюджеты проверяются числом. */
+interface TmcDebugApi {
+  readonly seed: number;
+  readonly layoutHash: number;
+  exportRoadGraph(): string;
+  stats(): Record<string, number>;
+  /** Телепорт машины для проверки районов (набережная, промзона). */
+  teleport(x: number, z: number): void;
+  carState(): Record<string, number>;
+}
+
+declare global {
+  interface Window {
+    __tmc?: TmcDebugApi;
+  }
+}
+
+function parseSeed(raw: string | null, fallback: number): number {
+  if (raw === null || raw === '') return fallback;
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) ? value >>> 0 : fallback;
+}
+
 export function bootstrap(): void {
   const container = document.getElementById('game');
   if (!container) throw new Error('Не найден контейнер #game');
+
+  const params = new URLSearchParams(window.location.search);
+  const debugWorld = params.get('debug') === '1';
+  const stressEnabled = params.get('stress') === '1';
+  const seed = parseSeed(params.get('seed'), WORLD.seed);
 
   const events = new EventBus<GameEvents>();
   const input = new InputMap();
@@ -99,7 +114,9 @@ export function bootstrap(): void {
   const inputState = createInputState();
   const debug = new DebugOverlay(document.getElementById('stats'));
   const frameStats = createDebugStats();
-  const stressEnabled = new URLSearchParams(window.location.search).get('stress') === '1';
+  frameStats.seed = seed;
+  frameStats.showWorld = debugWorld;
+  frameStats.stressActive = stressEnabled;
 
   // --- рендерер и сцена -----------------------------------------------------
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
@@ -113,7 +130,6 @@ export function bootstrap(): void {
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x10141a);
-  scene.fog = new THREE.Fog(0x10141a, 140, 300);
 
   const hemi = new THREE.HemisphereLight(0xcfe0ff, 0x3a2f24, 1.75);
   scene.add(hemi);
@@ -121,228 +137,43 @@ export function bootstrap(): void {
   const sun = new THREE.DirectionalLight(0xfff0d4, 2.5);
   sun.castShadow = true;
   sun.shadow.mapSize.set(1024, 1024);
-  sun.shadow.camera.left = -45;
-  sun.shadow.camera.right = 45;
-  sun.shadow.camera.top = 45;
-  sun.shadow.camera.bottom = -45;
+  sun.shadow.camera.left = -65;
+  sun.shadow.camera.right = 65;
+  sun.shadow.camera.top = 65;
+  sun.shadow.camera.bottom = -65;
   sun.shadow.camera.near = 1;
-  sun.shadow.camera.far = 220;
+  sun.shadow.camera.far = 260;
   sun.shadow.bias = -0.0006;
   scene.add(sun);
   scene.add(sun.target);
 
-  // --- коллизии и сущности --------------------------------------------------
-  const colliderHash = new SpatialHash<Collider>(TUNING.spatialCellSize);
+  // --- мир ------------------------------------------------------------------
+  // ?seed=N переопределяет сид всего мира: кварталы, граф, пропсы, вода.
+  const world = createWorld(seed, WORLD);
+  const colliderHash = world.colliders;
   const registry = new EntityRegistry(colliderHash);
   const collisionCandidates: Collider[] = [];
   const contact: Contact = { nx: 0, nz: 0, depth: 0 };
-  let nextColliderId = 1;
 
-  function addStaticCollider(x: number, z: number, hx: number, hz: number): void {
-    colliderHash.insert({ id: nextColliderId, x, z, hx, hz, angle: 0 });
-    nextColliderId += 1;
-  }
+  const worldWidth = world.bounds.maxX - world.bounds.minX;
+  const worldDepth = world.bounds.maxZ - world.bounds.minZ;
+  const worldRadius = Math.hypot(worldWidth, worldDepth) / 2;
+  // Туман и дальняя плоскость привязаны к bounds мира, а не к старой константе.
+  const fogFar = clamp(worldRadius * 0.33, 220, 300);
+  scene.fog = new THREE.Fog(0x10141a, fogFar * 0.5, fogFar);
+  const cameraFar = Math.max(700, worldRadius * 1.8);
 
-  // --- город ---------------------------------------------------------------
-  const rng = createRng(CITY_SEED);
-  const dummy = new THREE.Object3D();
-
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(520, 520),
-    new THREE.MeshLambertMaterial({ color: 0x2c323a }),
-  );
-  ground.rotation.x = -Math.PI / 2;
-  ground.receiveShadow = true;
-  scene.add(ground);
-
-  const plateGeo = new THREE.BoxGeometry(1, 1, 1);
-  const plateMat = new THREE.MeshLambertMaterial({ color: 0x4a525d });
-  const plateMesh = new THREE.InstancedMesh(plateGeo, plateMat, (GRID * 2 + 1) ** 2);
-  plateMesh.receiveShadow = true;
-  scene.add(plateMesh);
-
-  const palette = [0x8b93a1, 0x9c8f80, 0x7d8e9f, 0xa39887, 0x6f7b88];
-  const buildings: Building[] = [];
-  let plateIndex = 0;
-
-  for (let ix = -GRID; ix <= GRID; ix += 1) {
-    for (let iz = -GRID; iz <= GRID; iz += 1) {
-      const cx = ix * BLOCK_STEP;
-      const cz = iz * BLOCK_STEP;
-      dummy.position.set(cx, 0.25, cz);
-      dummy.scale.set(BLOCK_HALF * 2, 0.5, BLOCK_HALF * 2);
-      dummy.rotation.set(0, 0, 0);
-      dummy.updateMatrix();
-      plateMesh.setMatrixAt(plateIndex, dummy.matrix);
-      plateIndex += 1;
-
-      if (ix === 0 && iz === 0) continue; // центральная площадь
-
-      const w = 8 + rng.next() * 4;
-      const d = 8 + rng.next() * 4;
-      const h = 6 + rng.next() * 18;
-      const bx = cx + (rng.next() * 2 - 1) * (BLOCK_HALF - w / 2 - 1);
-      const bz = cz + (rng.next() * 2 - 1) * (BLOCK_HALF - d / 2 - 1);
-      const color = palette[Math.floor(rng.next() * palette.length)];
-      buildings.push({ x: bx, z: bz, w, d, h, color });
-      addStaticCollider(bx, bz, w / 2, d / 2);
-    }
-  }
-  plateMesh.count = plateIndex;
-  plateMesh.instanceMatrix.needsUpdate = true;
-
-  const buildingMesh = new THREE.InstancedMesh(
-    new THREE.BoxGeometry(1, 1, 1),
-    new THREE.MeshLambertMaterial({ color: 0xffffff }),
-    buildings.length,
-  );
-  buildingMesh.castShadow = true;
-  buildingMesh.receiveShadow = true;
-  const tint = new THREE.Color();
-
-  for (let i = 0; i < buildings.length; i += 1) {
-    const building = buildings[i];
-    dummy.position.set(building.x, building.h / 2 + 0.5, building.z);
-    dummy.scale.set(building.w, building.h, building.d);
-    dummy.rotation.set(0, 0, 0);
-    dummy.updateMatrix();
-    buildingMesh.setMatrixAt(i, dummy.matrix);
-    buildingMesh.setColorAt(i, tint.setHex(building.color));
-  }
-  buildingMesh.instanceMatrix.needsUpdate = true;
-  if (buildingMesh.instanceColor) buildingMesh.instanceColor.needsUpdate = true;
-  scene.add(buildingMesh);
-
-  // Разметка: пунктир по центрам дорог.
-  const dashes: Array<{ x: number; z: number; rot: number }> = [];
-  for (let ix = -GRID; ix <= GRID; ix += 1) {
-    const x = ix * BLOCK_STEP + BLOCK_STEP / 2;
-    if (Math.abs(x) > BOUND) continue;
-    for (let z = -BOUND + 4; z < BOUND; z += 6) dashes.push({ x, z, rot: 0 });
-  }
-  for (let iz = -GRID; iz <= GRID; iz += 1) {
-    const z = iz * BLOCK_STEP + BLOCK_STEP / 2;
-    if (Math.abs(z) > BOUND) continue;
-    for (let x = -BOUND + 4; x < BOUND; x += 6) dashes.push({ x, z, rot: Math.PI / 2 });
-  }
-  const dashMesh = new THREE.InstancedMesh(
-    new THREE.BoxGeometry(0.28, 0.03, 2.4),
-    new THREE.MeshBasicMaterial({ color: 0xcfd8e3 }),
-    dashes.length,
-  );
-  for (let i = 0; i < dashes.length; i += 1) {
-    const dash = dashes[i];
-    dummy.position.set(dash.x, 0.03, dash.z);
-    dummy.scale.set(1, 1, 1);
-    dummy.rotation.set(0, dash.rot, 0);
-    dummy.updateMatrix();
-    dashMesh.setMatrixAt(i, dummy.matrix);
-  }
-  dashMesh.instanceMatrix.needsUpdate = true;
-  scene.add(dashMesh);
-
-  // --- игрок ----------------------------------------------------------------
+  // --- машина ---------------------------------------------------------------
   const player = registry.create('player');
   const car = player.transform;
-  car.x = CAR_SPAWN_X;
-  car.z = CAR_SPAWN_Z;
-  car.prevX = CAR_SPAWN_X;
-  car.prevZ = CAR_SPAWN_Z;
+  const spawn = world.defaultSpawn;
+  car.x = spawn.x;
+  car.z = spawn.z;
+  car.heading = spawn.heading;
+  car.prevX = spawn.x;
+  car.prevZ = spawn.z;
+  car.prevHeading = spawn.heading;
 
-  // --- стресс-режим ?stress=1 ----------------------------------------------
-  let stressMesh: THREE.InstancedMesh | null = null;
-  const movers: MoverSpec[] = [];
-  let stressTime = 0;
-
-  if (stressEnabled) createStressScene();
-
-  function createStressScene(): void {
-    const staticCount = TUNING.stressStaticColliders;
-    const movingCount = TUNING.stressMovingColliders;
-    const mesh = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(1, 1, 1),
-      new THREE.MeshLambertMaterial({ color: 0xffffff }),
-      staticCount + movingCount,
-    );
-    mesh.receiveShadow = true;
-    stressMesh = mesh;
-    const color = new THREE.Color();
-    const stressRng = createRng(STRESS_SEED);
-
-    let placed = 0;
-    let attempts = 0;
-    while (placed < staticCount && attempts < staticCount * 10) {
-      attempts += 1;
-      const x = stressRng.range(-BOUND, BOUND);
-      const z = stressRng.range(-BOUND, BOUND);
-      // Не застраиваем точку спавна машины.
-      if (Math.abs(x - CAR_SPAWN_X) < 6 && Math.abs(z - CAR_SPAWN_Z) < 6) continue;
-      const hx = stressRng.range(STRESS_STATIC_HALF_MIN, STRESS_STATIC_HALF_MAX);
-      const hz = stressRng.range(STRESS_STATIC_HALF_MIN, STRESS_STATIC_HALF_MAX);
-      addStaticCollider(x, z, hx, hz);
-
-      dummy.position.set(x, STRESS_STATIC_HEIGHT / 2, z);
-      dummy.rotation.set(0, 0, 0);
-      dummy.scale.set(hx * 2, STRESS_STATIC_HEIGHT, hz * 2);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(placed, dummy.matrix);
-      mesh.setColorAt(placed, color.setHex(STRESS_STATIC_COLOR));
-      placed += 1;
-    }
-
-    const half = Math.floor(movingCount / 2);
-    for (let i = 0; i < movingCount; i += 1) {
-      const axis: 0 | 1 = i < half ? 0 : 1;
-      const laneSign = i % 2 === 0 ? 1 : -1;
-      const centerSign = Math.floor(i / 2) % 2 === 0 ? 1 : -1;
-      const handle = placed + i;
-      const phase = i * 2.399963229728653; // золотое сечение — без скоплений
-      const omega = 0.5 + (i % 5) * 0.08;
-      const entity = registry.create('prop');
-      const transform = entity.transform;
-      transform.x = axis === 0 ? centerSign * MOVER_CENTER + Math.sin(phase) * MOVER_AMPLITUDE : laneSign * MOVER_LANE + Math.cos(phase) * MOVER_WEAVE;
-      transform.z = axis === 0 ? laneSign * MOVER_LANE + Math.cos(phase) * MOVER_WEAVE : centerSign * MOVER_CENTER + Math.sin(phase) * MOVER_AMPLITUDE;
-      transform.prevX = transform.x;
-      transform.prevZ = transform.z;
-      registry.attachCollider(entity.id, MOVER_HALF, MOVER_HALF, 0);
-      registry.attachRenderRef(entity.id, handle);
-
-      const spec: MoverSpec = {
-        id: entity.id,
-        handle,
-        axis,
-        lane: laneSign * MOVER_LANE,
-        center: centerSign * MOVER_CENTER,
-        amplitude: MOVER_AMPLITUDE,
-        omega,
-        phase,
-      };
-      movers.push(spec);
-      writeMoverMatrix(mesh, spec.handle, transform.x, transform.z, 0);
-      mesh.setColorAt(handle, color.setHex(MOVER_COLOR));
-    }
-
-    mesh.count = placed + movingCount;
-    mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    scene.add(mesh);
-  }
-
-  function writeMoverMatrix(
-    mesh: THREE.InstancedMesh,
-    handle: number,
-    x: number,
-    z: number,
-    heading: number,
-  ): void {
-    dummy.position.set(x, MOVER_HEIGHT / 2, z);
-    dummy.rotation.set(0, heading, 0);
-    dummy.scale.set(MOVER_HALF * 2, MOVER_HEIGHT, MOVER_HALF * 2);
-    dummy.updateMatrix();
-    mesh.setMatrixAt(handle, dummy.matrix);
-  }
-
-  // --- машина --------------------------------------------------------------
   const carGroup = new THREE.Group();
   const body = new THREE.Mesh(
     new THREE.BoxGeometry(2.2, 0.7, 4.4),
@@ -376,7 +207,114 @@ export function bootstrap(): void {
     carGroup.add(wheel);
   }
   carGroup.position.set(car.x, 0, car.z);
+  carGroup.rotation.y = car.heading;
   scene.add(carGroup);
+
+  // --- стресс-режим ?stress=1 ----------------------------------------------
+  let stressMesh: THREE.InstancedMesh | null = null;
+  const movers: MoverSpec[] = [];
+  let stressTime = 0;
+  const stressDummy = new THREE.Object3D();
+
+  if (stressEnabled) createStressScene();
+
+  function createStressScene(): void {
+    const staticCount = TUNING.stressStaticColliders;
+    const movingCount = TUNING.stressMovingColliders;
+    const mesh = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(1, 1, 1),
+      new THREE.MeshLambertMaterial({ color: 0xffffff }),
+      staticCount + movingCount,
+    );
+    mesh.receiveShadow = true;
+    stressMesh = mesh;
+    const color = new THREE.Color();
+    const stressRng = createRng(STRESS_SEED);
+
+    let placed = 0;
+    let attempts = 0;
+    while (placed < staticCount && attempts < staticCount * 10) {
+      attempts += 1;
+      const x = car.x + stressRng.range(-STRESS_RADIUS, STRESS_RADIUS);
+      const z = car.z + stressRng.range(-STRESS_RADIUS, STRESS_RADIUS);
+      // Не застраиваем точку спавна машины.
+      if (Math.abs(x - car.x) < 6 && Math.abs(z - car.z) < 6) continue;
+      const hx = stressRng.range(STRESS_STATIC_HALF_MIN, STRESS_STATIC_HALF_MAX);
+      const hz = stressRng.range(STRESS_STATIC_HALF_MIN, STRESS_STATIC_HALF_MAX);
+      // Единый аллокатор мира: локальных счётчиков id в bootstrap нет (M3-A-06).
+      colliderHash.insert({ id: world.allocStaticId(), x, z, hx, hz, angle: 0 });
+
+      stressDummy.position.set(x, STRESS_STATIC_HEIGHT / 2, z);
+      stressDummy.rotation.set(0, 0, 0);
+      stressDummy.scale.set(hx * 2, STRESS_STATIC_HEIGHT, hz * 2);
+      stressDummy.updateMatrix();
+      mesh.setMatrixAt(placed, stressDummy.matrix);
+      mesh.setColorAt(placed, color.setHex(STRESS_STATIC_COLOR));
+      placed += 1;
+    }
+
+    const half = Math.floor(movingCount / 2);
+    for (let i = 0; i < movingCount; i += 1) {
+      const axis: 0 | 1 = i < half ? 0 : 1;
+      const laneSign = i % 2 === 0 ? 1 : -1;
+      const centerSign = Math.floor(i / 2) % 2 === 0 ? 1 : -1;
+      const handle = placed + i;
+      const phase = i * 2.399963229728653;
+      const omega = 0.5 + (i % 5) * 0.08;
+      const entity = registry.create('prop');
+      const transform = entity.transform;
+      transform.x =
+        car.x +
+        (axis === 0
+          ? centerSign * MOVER_CENTER + Math.sin(phase) * MOVER_AMPLITUDE
+          : laneSign * MOVER_LANE + Math.cos(phase) * MOVER_WEAVE);
+      transform.z =
+        car.z +
+        (axis === 0
+          ? laneSign * MOVER_LANE + Math.cos(phase) * MOVER_WEAVE
+          : centerSign * MOVER_CENTER + Math.sin(phase) * MOVER_AMPLITUDE);
+      transform.prevX = transform.x;
+      transform.prevZ = transform.z;
+      registry.attachCollider(entity.id, MOVER_HALF, MOVER_HALF, 0);
+      registry.attachRenderRef(entity.id, handle);
+
+      const spec: MoverSpec = {
+        id: entity.id,
+        handle,
+        axis,
+        lane: laneSign * MOVER_LANE,
+        center: centerSign * MOVER_CENTER,
+        amplitude: MOVER_AMPLITUDE,
+        omega,
+        phase,
+      };
+      movers.push(spec);
+      writeMoverMatrix(mesh, spec.handle, transform.x, transform.z, 0);
+      mesh.setColorAt(handle, color.setHex(MOVER_COLOR));
+    }
+
+    mesh.count = placed + movingCount;
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    scene.add(mesh);
+  }
+
+  function writeMoverMatrix(
+    mesh: THREE.InstancedMesh,
+    handle: number,
+    x: number,
+    z: number,
+    heading: number,
+  ): void {
+    stressDummy.position.set(x, MOVER_HEIGHT / 2, z);
+    stressDummy.rotation.set(0, heading, 0);
+    stressDummy.scale.set(MOVER_HALF * 2, MOVER_HEIGHT, MOVER_HALF * 2);
+    stressDummy.updateMatrix();
+    mesh.setMatrixAt(handle, stressDummy.matrix);
+  }
+
+  // --- город (меши по чанкам) ----------------------------------------------
+  const cityView = createCityView(scene, world.config);
 
   // --- камера --------------------------------------------------------------
   const followCamera = new FollowCamera({
@@ -386,6 +324,7 @@ export function bootstrap(): void {
     damp: CAMERA_DAMP,
     lookAhead: CAMERA_LOOK_AHEAD,
     maxLookAhead: CAMERA_MAX_LOOK_AHEAD,
+    far: cameraFar,
   });
   followCamera.resize(window.innerWidth, window.innerHeight);
 
@@ -401,6 +340,12 @@ export function bootstrap(): void {
   applyCamera();
 
   function applyCamera(): void {
+    const bounds = world.bounds;
+    // Камера не выезжает за пределы мира (?seed и любой размер из конфига).
+    followCamera.position.x = clamp(followCamera.position.x, bounds.minX, bounds.maxX);
+    followCamera.position.z = clamp(followCamera.position.z, bounds.minZ, bounds.maxZ);
+    followCamera.target.x = clamp(followCamera.target.x, bounds.minX, bounds.maxX);
+    followCamera.target.z = clamp(followCamera.target.z, bounds.minZ, bounds.maxZ);
     camera.position.set(followCamera.position.x, followCamera.position.y, followCamera.position.z);
     camera.lookAt(followCamera.target.x, followCamera.target.y, followCamera.target.z);
   }
@@ -410,18 +355,42 @@ export function bootstrap(): void {
   const carBody: CircleBody = { x: car.x, z: car.z, vx: 0, vz: 0, radius: CAR_RADIUS };
   const solveResult: SolveResult = { hit: false, contacts: 0, impact: 0, substeps: 0 };
   const moverBody: Rect = { x: 0, z: 0, hx: MOVER_HALF, hz: MOVER_HALF, angle: 0 };
+  const spawnQuery: SpawnPoint[] = [];
+
+  /** Респавн берётся из querySpawnPoints, а не из константы (M3-A-05). */
+  function pickRespawn(): SpawnPoint {
+    world.querySpawnPoints(car.x, car.z, 450, 'car', spawnQuery);
+    let best: SpawnPoint | null = null;
+    let fallback: SpawnPoint | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < spawnQuery.length; i += 1) {
+      const point = spawnQuery[i];
+      if (!fallback) fallback = point;
+      const dx = point.x - car.x;
+      const dz = point.z - car.z;
+      const dist = dx * dx + dz * dz;
+      if (dist < 100) continue; // не телепортируем на текущее место
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = point;
+      }
+    }
+    return best ?? fallback ?? world.defaultSpawn;
+  }
 
   function resetCar(): void {
-    car.x = CAR_SPAWN_X;
-    car.z = CAR_SPAWN_Z;
-    car.heading = 0;
+    const point = pickRespawn();
+    car.x = point.x;
+    car.z = point.z;
+    car.heading = point.heading;
     car.vx = 0;
     car.vz = 0;
-    car.prevX = car.x;
-    car.prevZ = car.z;
-    car.prevHeading = 0;
+    car.prevX = point.x;
+    car.prevZ = point.z;
+    car.prevHeading = point.heading;
     speedKmh = 0;
     followCamera.snapTo(car.x, car.z);
+    world.prefetch(car.x, car.z);
   }
 
   function updateCar(dt: number): void {
@@ -449,8 +418,8 @@ export function bootstrap(): void {
       else forward -= CAR_TUNING.accel * 0.65 * dt;
     }
 
-    forward -= forward * 0.55 * dt; // сопротивление
-    forward -= Math.sign(forward) * Math.min(Math.abs(forward), 2.2 * dt); // качение
+    forward -= forward * 0.55 * dt;
+    forward -= Math.sign(forward) * Math.min(Math.abs(forward), 2.2 * dt);
     forward = clamp(forward, -CAR_TUNING.maxReverse, CAR_TUNING.maxSpeed);
 
     const steerFactor = Math.min(1, Math.abs(forward) / 6);
@@ -467,8 +436,10 @@ export function bootstrap(): void {
     carBody.vz = car.vz;
     moveCircle(carBody, dt, colliderHash, collisionCandidates, contact, TUNING, solveResult);
 
-    car.x = clamp(carBody.x, -BOUND, BOUND);
-    car.z = clamp(carBody.z, -BOUND, BOUND);
+    // Кламп по world.bounds, а не по старой константе 75 (M3-A-14).
+    const margin = CAR_RADIUS + 1.5;
+    car.x = clamp(carBody.x, world.bounds.minX + margin, world.bounds.maxX - margin);
+    car.z = clamp(carBody.z, world.bounds.minZ + margin, world.bounds.maxZ - margin);
     car.vx = carBody.vx;
     car.vz = carBody.vz;
 
@@ -536,15 +507,72 @@ export function bootstrap(): void {
     mesh.instanceMatrix.needsUpdate = true;
   }
 
+  // --- префетч окружения до первого кадра ----------------------------------
+  const prefetchMs = world.prefetch(car.x, car.z);
+  cityView.sync(world);
+
+  if (debugWorld) {
+    // layoutHash считается один раз и доступен и в HUD, и в window.__tmc.
+    const layoutHash = world.layoutHash;
+    frameStats.layoutHash = layoutHash;
+    window.__tmc = {
+      seed,
+      layoutHash,
+      exportRoadGraph: () => serializeRoadGraph(world.roadGraph),
+      stats: () => {
+        const stats = world.stats;
+        return {
+          seed,
+          layoutHash,
+          chunks: world.activeChunks.length,
+          colliders: stats.colliders,
+          genMaxMs: stats.genMaxMs,
+          genLastMs: stats.genLastMs,
+          genCount: stats.genCount,
+          updateMs: stats.updateMs,
+          spawnPoints: stats.spawnPoints,
+          drawCalls: renderer.info.render.calls,
+          triangles: renderer.info.render.triangles,
+          prefetchMs,
+        };
+      },
+      teleport: (x, z) => {
+        const margin = CAR_RADIUS + 1.5;
+        car.x = clamp(x, world.bounds.minX + margin, world.bounds.maxX - margin);
+        car.z = clamp(z, world.bounds.minZ + margin, world.bounds.maxZ - margin);
+        car.vx = 0;
+        car.vz = 0;
+        car.prevX = car.x;
+        car.prevZ = car.z;
+        followCamera.snapTo(car.x, car.z);
+        world.prefetch(car.x, car.z);
+      },
+      carState: () => ({
+        x: Number(car.x.toFixed(2)),
+        z: Number(car.z.toFixed(2)),
+        heading: Number(car.heading.toFixed(3)),
+        speedKmh: Number(speedKmh.toFixed(1)),
+      }),
+    };
+  }
+
   // --- фикс. шаг ------------------------------------------------------------
   let logicMsSum = 0;
   let logicSamples = 0;
+  let streamTimer = 0;
 
   function step(dt: number): void {
     const started = performance.now();
     updateCar(dt);
     updateStressMovers(dt);
     registry.flush();
+
+    streamTimer += dt;
+    if (streamTimer >= STREAM_INTERVAL) {
+      streamTimer = 0;
+      world.update(car.x, car.z);
+    }
+
     logicMsSum += performance.now() - started;
     logicSamples += 1;
   }
@@ -559,17 +587,19 @@ export function bootstrap(): void {
     carGroup.rotation.y = heading;
 
     syncStressMovers(alpha);
+    cityView.sync(world);
 
     followCamera.update(frameDt, x, z, car.vx, car.vz);
     applyCamera();
 
-    sun.position.set(x + 35, 80, z + 25);
+    sun.position.set(x + 55, 105, z + 40);
     sun.target.position.set(x, 0, z);
     sun.target.updateMatrixWorld();
 
     renderer.render(scene, camera);
 
     const info = renderer.info.render;
+    const worldStats = world.stats;
     frameStats.drawCalls = info.calls;
     frameStats.triangles = info.triangles;
     frameStats.speedKmh = speedKmh;
@@ -579,6 +609,10 @@ export function bootstrap(): void {
     frameStats.overrun = loop.overrun;
     frameStats.debtMs = loop.debt * 1000;
     frameStats.logicMs = logicSamples > 0 ? logicMsSum / logicSamples : 0;
+    frameStats.chunks = world.activeChunks.length;
+    frameStats.chunkGenMaxMs = worldStats.genMaxMs;
+    frameStats.chunkGenLastMs = worldStats.genLastMs;
+    frameStats.worldUpdateMs = worldStats.updateMs;
     logicMsSum = 0;
     logicSamples = 0;
 

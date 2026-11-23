@@ -1,8 +1,9 @@
 // ---------------------------------------------------------------------------
 // Отладочный оверлей: fps, время кадра, время логики, draw calls, tris,
 // коллайдеры, сущности, overrun и накопленный долг симуляции.
+// Под ?debug=1 добавляется строка мира: чанки, максимум генерации чанка,
+// время world.update, сид и layoutHash (M3-A-02, M3-A-16).
 // Текст обновляется раз в 0.5 с, чтобы не дёргать DOM каждый кадр.
-// Счётчики передаются переиспользуемым объектом — без аллокаций в кадре.
 // ---------------------------------------------------------------------------
 
 const REFRESH_INTERVAL = 0.5;
@@ -23,6 +24,22 @@ export interface DebugFrameStats {
   debtMs: number;
   /** Время последнего фикс. шага логики, мс. */
   logicMs: number;
+  /** Активных чанков мира. */
+  chunks: number;
+  /** Максимум генерации чанка за сеанс, мс (не среднее). */
+  chunkGenMaxMs: number;
+  /** Время последней генерации чанка, мс. */
+  chunkGenLastMs: number;
+  /** Время последнего world.update, мс. */
+  worldUpdateMs: number;
+  /** Сид мира текущего запуска. */
+  seed: number;
+  /** FNV-1a хэш планировки (0 — не считался). */
+  layoutHash: number;
+  /** Показывать строку мира (?debug=1). */
+  showWorld: boolean;
+  /** Активен ли стресс-режим (?stress=1). */
+  stressActive: boolean;
 }
 
 export function createDebugStats(): DebugFrameStats {
@@ -36,6 +53,14 @@ export function createDebugStats(): DebugFrameStats {
     overrun: 0,
     debtMs: 0,
     logicMs: 0,
+    chunks: 0,
+    chunkGenMaxMs: 0,
+    chunkGenLastMs: 0,
+    worldUpdateMs: 0,
+    seed: 0,
+    layoutHash: 0,
+    showWorld: false,
+    stressActive: false,
   };
 }
 
@@ -66,11 +91,22 @@ export class DebugOverlay {
     const frameMs = this.frameMsSum / this.frames;
     const logicMs = this.logicMsSum / this.frames;
 
-    this.element.textContent =
+    let text =
       `fps ${Math.round(fps)}   frame ${frameMs.toFixed(1)} ms   logic ${logicMs.toFixed(2)} ms   speed ${Math.round(stats.speedKmh)} km/h\n` +
       `draw calls ${stats.drawCalls}   tris ${(stats.triangles / 1000).toFixed(1)}k   ` +
       `colliders ${stats.colliders} (dyn ${stats.movingColliders})   entities ${stats.entities}\n` +
       `overrun ${stats.overrun} steps   debt ${stats.debtMs.toFixed(0)} ms`;
+
+    if (stats.showWorld) {
+      const hash = stats.layoutHash >>> 0;
+      text +=
+        `\nchunks ${stats.chunks}   gen max ${stats.chunkGenMaxMs.toFixed(1)} ms` +
+        `   last ${stats.chunkGenLastMs.toFixed(1)} ms   world ${stats.worldUpdateMs.toFixed(2)} ms` +
+        `\nseed ${stats.seed}   layout ${hash.toString(16).padStart(8, '0')}`;
+    }
+    if (stats.stressActive) text += '   stress on';
+
+    this.element.textContent = text;
 
     this.frames = 0;
     this.elapsed = 0;
