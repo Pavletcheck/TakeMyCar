@@ -38,13 +38,15 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
 container.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b0e12);
-scene.fog = new THREE.Fog(0x0b0e12, 150, 320);
+scene.background = new THREE.Color(0x10141a);
+scene.fog = new THREE.Fog(0x10141a, 140, 300);
 
-const VIEW_HEIGHT = 80;
+const VIEW_HEIGHT = 62;
 const aspect = window.innerWidth / window.innerHeight;
 const camera = new THREE.OrthographicCamera(
   (-VIEW_HEIGHT * aspect) / 2,
@@ -57,10 +59,10 @@ const camera = new THREE.OrthographicCamera(
 camera.position.set(0, 72, 40);
 camera.lookAt(0, 0, 0);
 
-const hemi = new THREE.HemisphereLight(0xbcd4ff, 0x2a2118, 1.15);
+const hemi = new THREE.HemisphereLight(0xcfe0ff, 0x3a2f24, 1.75);
 scene.add(hemi);
 
-const sun = new THREE.DirectionalLight(0xffe8c0, 2.1);
+const sun = new THREE.DirectionalLight(0xfff0d4, 2.5);
 sun.castShadow = true;
 sun.shadow.mapSize.set(1024, 1024);
 sun.shadow.camera.left = -45;
@@ -78,14 +80,14 @@ const colliders: Rect[] = [];
 
 const ground = new THREE.Mesh(
   new THREE.PlaneGeometry(520, 520),
-  new THREE.MeshLambertMaterial({ color: 0x24282e }),
+  new THREE.MeshLambertMaterial({ color: 0x2c323a }),
 );
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
 
 const plateGeo = new THREE.BoxGeometry(1, 1, 1);
-const plateMat = new THREE.MeshLambertMaterial({ color: 0x39404a });
+const plateMat = new THREE.MeshLambertMaterial({ color: 0x4a525d });
 const plateMesh = new THREE.InstancedMesh(plateGeo, plateMat, 25);
 plateMesh.receiveShadow = true;
 scene.add(plateMesh);
@@ -113,8 +115,8 @@ for (let ix = -GRID; ix <= GRID; ix += 1) {
     const h = 6 + rand() * 18;
     const bx = cx + (rand() * 2 - 1) * (BLOCK_HALF - w / 2 - 1);
     const bz = cz + (rand() * 2 - 1) * (BLOCK_HALF - d / 2 - 1);
-    const palette = [0x6b7280, 0x7c6f64, 0x5b6b7c, 0x8a7f72, 0x4f5a66];
-    buildings.push({ x: bx, z: bz, w, d, h, color: palette[Math.floor(rand() * palette.length)] ?? 0x6b7280 });
+    const palette = [0x8b93a1, 0x9c8f80, 0x7d8e9f, 0xa39887, 0x6f7b88];
+    buildings.push({ x: bx, z: bz, w, d, h, color: palette[Math.floor(rand() * palette.length)] ?? 0x8b93a1 });
     colliders.push({ x: bx, z: bz, hx: w / 2, hz: d / 2 });
   }
 }

@@ -61,11 +61,14 @@ docs/                — концепт, роадмап, ADR, платформе
 - `node_modules`, `dist`, `outputs`, `.cache`, `*.blend1` — в `.gitignore`.
 
 ## Деплой после каждого этапа (обязательно)
-- Репозиторий: `Pavletcheck/TakeMyCar` (публичный), ветка `main`.
+- Репозиторий: `Pavletcheck/TakeMyCar` (публичный). Ветка `main` — исходники,
+  ветка `gh-pages` — собранный `dist`.
 - Живая ссылка: https://pavletcheck.github.io/TakeMyCar/
-- Каждый пуш в `main` собирается и деплоится workflow `.github/workflows/deploy.yml`.
+- Деплой: `npm run deploy` (сборка + публикация через `gh-pages`).
 - Этап не считается закрытым, пока ссылка не открывается на десктопе и телефоне.
 - Версия, тег `m<N>` и релиз-ноты в `docs/releases/M<N>.md` — часть этапа.
+- CI-воркфлоу подготовлен в `docs/ci/deploy-workflow.yml`; включится после
+  `gh auth refresh -s workflow` (сейчас у токена нет scope `workflow`).
 - Подробности и откат: `промпты/10_RELEASE.md`, агент `release`.
 
 ## Definition of Done
