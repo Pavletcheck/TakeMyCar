@@ -1,18 +1,35 @@
 import * as THREE from 'three';
 import { FollowCamera } from '../core/camera';
-import { moveCircle, resolveRectBody } from '../core/collision';
-import type { CircleBody, SolveResult } from '../core/collision';
+import { resolveRectBody } from '../core/collision';
 import { EventBus } from '../core/events';
 import { attachKeyboard, createInputState, InputMap } from '../core/input';
 import { GameLoop } from '../core/loop';
-import { clamp, lerp, lerpAngle } from '../core/math';
-import type { Collider, Contact, Rect } from '../core/math';
+import { clamp, circleRect, lerp, lerpAngle } from '../core/math';
+import type { Collider, Contact } from '../core/math';
 import { EntityRegistry } from '../core/registry';
 import type { EntityId } from '../core/registry';
 import { createRng } from '../core/rng';
+import { SpatialHash } from '../core/spatialHash';
 import { createCityView } from '../render/cityView';
+import { createPlayerView } from '../render/playerView';
+import { createVehicleView } from '../render/vehicleView';
 import { TUNING } from '../config/tuning';
 import { WORLD } from '../config/world';
+import { VEHICLE_TYPES, isVehicleType, vehicleColliderRadius } from '../config/vehicles';
+import { PLAYER } from '../config/player';
+import type { VehicleTypeId } from '../config/vehicles';
+import {
+  VehicleFleet,
+  createVehicle,
+  damageVehicle,
+  destroyVehicle,
+  repositionVehicle,
+  repairVehicleFull,
+} from '../entities/vehicle';
+import type { VehicleState } from '../entities/vehicle';
+import { IDLE_VEHICLE_INPUT, VehiclePhysics } from '../systems/vehiclePhysics';
+import { createVehicleAudio } from '../systems/vehicleAudio';
+import { PlayerController } from '../systems/playerController';
 import { DEFAULT_MAP_ID, loadCityMap } from '../world/mapLoader';
 import { serializeRoadGraph } from '../world/roadGraph';
 import type { SpawnPoint } from '../world/types';
@@ -20,24 +37,15 @@ import { buildWorldFromMap } from '../world/world';
 import { createDebugStats, DebugOverlay } from './debug';
 
 // ---------------------------------------------------------------------------
-// M3. Композиционный корень: рендер/сцена, мир (createWorld + cityView),
-// машина, камера, цикл и отладка. Three.js живёт только здесь и в render/**.
-// Город больше не строится инлайном: данные — src/world/**, меши — cityView.
+// M4. Композиционный корень: мир, флот машин, игрок (за рулём и пешком),
+// камера, цикл, HUD и отладка. Three.js живёт только здесь и в render/**.
+//
+// Машина больше не «car = player.transform»: у каждой машины свой
+// VehicleState в EntityRegistry, игрок — отдельная сущность. Активная цель
+// камеры — машина под управлением или пешеход.
 // ---------------------------------------------------------------------------
 
 const STREAM_INTERVAL = 0.25;
-
-const CAR_RADIUS = 1.8;
-
-const CAR_TUNING = {
-  accel: 22,
-  brake: 34,
-  maxSpeed: 30,
-  maxReverse: 9,
-  steerRate: 2.6,
-  grip: 6.5,
-  handbrakeGrip: 0.8,
-} as const;
 
 const VIEW_HEIGHT = 110;
 const CAMERA_HEIGHT = 130;
@@ -45,6 +53,23 @@ const CAMERA_BACK_OFFSET = 62;
 const CAMERA_DAMP = 6;
 const CAMERA_LOOK_AHEAD = 0.3;
 const CAMERA_MAX_LOOK_AHEAD = 5;
+
+/** Сколько городских машин ставим на точках world.spawns.cars (5–8 по брифу). */
+const CITY_CAR_COUNT = 6;
+/** Не ставим городскую машину слишком близко к старту игрока, м. */
+const CITY_CAR_MIN_PLAYER_DISTANCE = 25;
+/** Радиус свободного места под городскую машину: габарит грузовика + запас, м. */
+const CITY_CAR_CLEAR_RADIUS = 3;
+/** Городские типы: полицейская ставится отдельно у участка. */
+const CITY_CAR_TYPES: readonly VehicleTypeId[] = ['sports', 'van', 'truck', 'sedan', 'sports', 'van'];
+/** Период обновления текстового HUD, с. */
+const HUD_INTERVAL = 0.1;
+/** Полный газ для отладочного замера разгона. */
+const FULL_THROTTLE = Object.freeze({ throttle: 1, brake: 0, steer: 0, handbrake: false });
+/** Тряска камеры при ударе: длительность и амплитуда. */
+const SHAKE_DURATION = 0.3;
+const SHAKE_MAX = 1;
+const SHAKE_SCALE = 0.55;
 
 // Стресс-режим ?stress=1: 300 статических + 50 движущихся тел вокруг спавна.
 const STRESS_SEED = 0x5157e55;
@@ -75,18 +100,35 @@ interface MoverSpec {
   amplitude: number;
   omega: number;
   phase: number;
+  /** Якорь спавна: тела создавались относительно машины, а не мирового нуля. */
+  anchorX: number;
+  anchorZ: number;
 }
 
-/** Отладочный API под ?debug=1: карта, бюджеты и граф проверяются числом. */
+/** Отладочный API под ?debug=1: карта, бюджеты, машины и физика. */
 interface TmcDebugApi {
   readonly mapId: string;
   readonly seed: number;
   readonly layoutHash: number;
   exportRoadGraph(): string;
   stats(): Record<string, number | string>;
-  /** Телепорт машины для проверки районов (набережная, промзона). */
+  /** Телепорт активной цели (машины или игрока). */
   teleport(x: number, z: number): void;
-  carState(): Record<string, number>;
+  carState(): Record<string, number | string>;
+  vehicleStats(): Record<string, number | string>;
+  /** Заспавнить машину; без координат — на дороге рядом с игроком. */
+  spawnVehicle(type?: string, x?: number, z?: number, heading?: number): number;
+  /** Нанести урон активной машине; вернуть 1, если она уничтожена. */
+  damageActive(amount: number): number;
+  repairActive(): void;
+  enterVehicle(): number;
+  exitVehicle(): number;
+  /** Бенчмарк чистой физики: count машин × ticks шагов, мс. */
+  physicsBench(count?: number, ticks?: number): Record<string, number>;
+  /** Замер разгона до maxSpeed на пустом хэше для всех 5 типов (BUG-M4-002). */
+  speedProbe(): Record<string, number | string>;
+  /** Состояние стресс-режима: якорь и максимальное удаление тел от него. */
+  stressState(): Record<string, number>;
 }
 
 declare global {
@@ -112,6 +154,7 @@ export function bootstrap(): void {
   attachKeyboard(input, window);
   const inputState = createInputState();
   const debug = new DebugOverlay(document.getElementById('stats'));
+  const hintElement = document.getElementById('hint');
   const frameStats = createDebugStats();
   frameStats.seed = seed;
   frameStats.mapId = map.id;
@@ -154,6 +197,8 @@ export function bootstrap(): void {
   const registry = new EntityRegistry(colliderHash);
   const collisionCandidates: Collider[] = [];
   const contact: Contact = { nx: 0, nz: 0, depth: 0 };
+  const freeCandidates: Collider[] = [];
+  const freeContact: Contact = { nx: 0, nz: 0, depth: 0 };
 
   const worldWidth = world.bounds.maxX - world.bounds.minX;
   const worldDepth = world.bounds.maxZ - world.bounds.minZ;
@@ -163,58 +208,149 @@ export function bootstrap(): void {
   scene.fog = new THREE.Fog(0x10141a, fogFar * 0.5, fogFar);
   const cameraFar = Math.max(700, worldRadius * 1.8);
 
-  // --- машина ---------------------------------------------------------------
-  const player = registry.create('player');
-  const car = player.transform;
   const spawn = world.defaultSpawn;
-  car.x = spawn.x;
-  car.z = spawn.z;
-  car.heading = spawn.heading;
-  car.prevX = spawn.x;
-  car.prevZ = spawn.z;
-  car.prevHeading = spawn.heading;
 
-  const carGroup = new THREE.Group();
-  const body = new THREE.Mesh(
-    new THREE.BoxGeometry(2.2, 0.7, 4.4),
-    new THREE.MeshLambertMaterial({ color: 0xff5c5c }),
-  );
-  body.position.y = 0.65;
-  body.castShadow = true;
-  carGroup.add(body);
+  // --- игрок и флот машин ---------------------------------------------------
+  const player = registry.create('player');
+  const playerTransform = player.transform;
+  playerTransform.x = spawn.x;
+  playerTransform.z = spawn.z;
+  playerTransform.heading = spawn.heading;
+  playerTransform.prevX = spawn.x;
+  playerTransform.prevZ = spawn.z;
+  playerTransform.prevHeading = spawn.heading;
 
-  const cabin = new THREE.Mesh(
-    new THREE.BoxGeometry(1.9, 0.6, 2.1),
-    new THREE.MeshLambertMaterial({ color: 0x1a2230 }),
-  );
-  cabin.position.set(0, 1.25, -0.15);
-  cabin.castShadow = true;
-  carGroup.add(cabin);
+  const fleet = new VehicleFleet();
+  // Стартовая машина — седан в точке игрока: ощущения M3 сохранены.
+  const startVehicle = createVehicle(fleet, registry, {
+    type: 'sedan',
+    x: spawn.x,
+    z: spawn.z,
+    heading: spawn.heading,
+    colorIndex: 0,
+  });
 
-  const wheelGeo = new THREE.CylinderGeometry(0.42, 0.42, 0.36, 12);
-  const wheelMat = new THREE.MeshLambertMaterial({ color: 0x11151b });
-  const wheelOffsets = [
-    [-1.05, 1.45],
-    [1.05, 1.45],
-    [-1.05, -1.45],
-    [1.05, -1.45],
-  ] as const;
-  for (const [wx, wz] of wheelOffsets) {
-    const wheel = new THREE.Mesh(wheelGeo, wheelMat);
-    wheel.rotation.z = Math.PI / 2;
-    wheel.position.set(wx, 0.42, wz);
-    wheel.castShadow = true;
-    carGroup.add(wheel);
+  function placementFree(x: number, z: number, radius: number): boolean {
+    colliderHash.queryCircle(x, z, radius + TUNING.collisionSkin, freeCandidates);
+    for (let i = 0; i < freeCandidates.length; i += 1) {
+      if (circleRect(x, z, radius, freeCandidates[i], freeContact)) return false;
+    }
+    return true;
   }
-  carGroup.position.set(car.x, 0, car.z);
-  carGroup.rotation.y = car.heading;
-  scene.add(carGroup);
+
+  /** То же, но без динамических коллайдеров: проверка «не в здании/воде». */
+  function placementFreeStatic(x: number, z: number, radius: number): boolean {
+    colliderHash.queryCircle(x, z, radius + TUNING.collisionSkin, freeCandidates);
+    for (let i = 0; i < freeCandidates.length; i += 1) {
+      if (freeCandidates[i].id < 0) continue;
+      if (circleRect(x, z, radius, freeCandidates[i], freeContact)) return false;
+    }
+    return true;
+  }
+
+  /** Свободное место с явным исключением своего коллайдера (BUG-M4-005). */
+  function placementFreeExcept(
+    x: number,
+    z: number,
+    radius: number,
+    ignoreColliderId: number,
+  ): boolean {
+    colliderHash.queryCircle(x, z, radius + TUNING.collisionSkin, freeCandidates);
+    for (let i = 0; i < freeCandidates.length; i += 1) {
+      const candidate = freeCandidates[i];
+      if (candidate.id === ignoreColliderId) continue;
+      if (circleRect(x, z, radius, candidate, freeContact)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Городские машины на точках world.spawns.cars: разные типы, полицейская —
+   * на точке, ближайшей к ориентиру police. Точки проверяются по SpatialHash,
+   * чтобы не ставить машину в здание или на уже занятое место.
+   */
+  function spawnCityVehicles(): void {
+    const carSpawns = world.map.spawns.cars;
+    if (carSpawns.length === 0) return;
+
+    let policeLandmarkX = Number.NaN;
+    let policeLandmarkZ = Number.NaN;
+    for (let i = 0; i < world.map.landmarks.length; i += 1) {
+      const landmark = world.map.landmarks[i];
+      if (landmark.kind === 'police') {
+        policeLandmarkX = landmark.x;
+        policeLandmarkZ = landmark.z;
+        break;
+      }
+    }
+
+    let policeIndex = -1;
+    if (Number.isFinite(policeLandmarkX)) {
+      let bestDistance = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < carSpawns.length; i += 1) {
+        const dx = carSpawns[i].x - policeLandmarkX;
+        const dz = carSpawns[i].z - policeLandmarkZ;
+        const distance = dx * dx + dz * dz;
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          policeIndex = i;
+        }
+      }
+    }
+
+    const valid: number[] = [];
+    for (let i = 0; i < carSpawns.length; i += 1) {
+      const point = carSpawns[i];
+      const dx = point.x - spawn.x;
+      const dz = point.z - spawn.z;
+      if (dx * dx + dz * dz < CITY_CAR_MIN_PLAYER_DISTANCE * CITY_CAR_MIN_PLAYER_DISTANCE) continue;
+      if (!placementFree(point.x, point.z, CITY_CAR_CLEAR_RADIUS)) continue;
+      valid.push(i);
+    }
+
+    // Добираем до 5 машин даже если часть точек занята/близка к старту.
+    for (let i = 0; i < carSpawns.length && valid.length < 5; i += 1) {
+      if (valid.includes(i)) continue;
+      const point = carSpawns[i];
+      const dx = point.x - spawn.x;
+      const dz = point.z - spawn.z;
+      if (dx * dx + dz * dz < CITY_CAR_MIN_PLAYER_DISTANCE * CITY_CAR_MIN_PLAYER_DISTANCE) continue;
+      valid.push(i);
+    }
+
+    const chosen = valid.slice(0, CITY_CAR_COUNT);
+    // Полицейская обязательно рядом с участком: если её точку не выбрали,
+    // меняем последнюю выбранную на неё.
+    if (policeIndex >= 0 && !chosen.includes(policeIndex)) {
+      if (valid.includes(policeIndex)) {
+        if (chosen.length > 0) chosen[chosen.length - 1] = policeIndex;
+        else chosen.push(policeIndex);
+      }
+    }
+
+    for (let i = 0; i < chosen.length; i += 1) {
+      const mapIndex = chosen[i];
+      const point = carSpawns[mapIndex];
+      const type = mapIndex === policeIndex ? 'police' : CITY_CAR_TYPES[i % CITY_CAR_TYPES.length];
+      createVehicle(fleet, registry, {
+        type,
+        x: point.x,
+        z: point.z,
+        heading: point.heading,
+        colorIndex: (i + 1) % 4,
+      });
+    }
+  }
+
+  spawnCityVehicles();
 
   // --- стресс-режим ?stress=1 ----------------------------------------------
-  let stressMesh: THREE.InstancedMesh | null = null;
   const movers: MoverSpec[] = [];
   let stressTime = 0;
   const stressDummy = new THREE.Object3D();
+  let stressMeshRef: THREE.InstancedMesh | null = null;
+  const startX = startVehicle.transform.x;
+  const startZ = startVehicle.transform.z;
 
   if (stressEnabled) createStressScene();
 
@@ -227,7 +363,7 @@ export function bootstrap(): void {
       staticCount + movingCount,
     );
     mesh.receiveShadow = true;
-    stressMesh = mesh;
+    stressMeshRef = mesh;
     const color = new THREE.Color();
     const stressRng = createRng(STRESS_SEED);
 
@@ -235,10 +371,10 @@ export function bootstrap(): void {
     let attempts = 0;
     while (placed < staticCount && attempts < staticCount * 10) {
       attempts += 1;
-      const x = car.x + stressRng.range(-STRESS_RADIUS, STRESS_RADIUS);
-      const z = car.z + stressRng.range(-STRESS_RADIUS, STRESS_RADIUS);
+      const x = startX + stressRng.range(-STRESS_RADIUS, STRESS_RADIUS);
+      const z = startZ + stressRng.range(-STRESS_RADIUS, STRESS_RADIUS);
       // Не застраиваем точку спавна машины.
-      if (Math.abs(x - car.x) < 6 && Math.abs(z - car.z) < 6) continue;
+      if (Math.abs(x - startX) < 6 && Math.abs(z - startZ) < 6) continue;
       const hx = stressRng.range(STRESS_STATIC_HALF_MIN, STRESS_STATIC_HALF_MAX);
       const hz = stressRng.range(STRESS_STATIC_HALF_MIN, STRESS_STATIC_HALF_MAX);
       // Единый аллокатор мира: локальных счётчиков id в bootstrap нет (M3-A-06).
@@ -264,12 +400,12 @@ export function bootstrap(): void {
       const entity = registry.create('prop');
       const transform = entity.transform;
       transform.x =
-        car.x +
+        startX +
         (axis === 0
           ? centerSign * MOVER_CENTER + Math.sin(phase) * MOVER_AMPLITUDE
           : laneSign * MOVER_LANE + Math.cos(phase) * MOVER_WEAVE);
       transform.z =
-        car.z +
+        startZ +
         (axis === 0
           ? laneSign * MOVER_LANE + Math.cos(phase) * MOVER_WEAVE
           : centerSign * MOVER_CENTER + Math.sin(phase) * MOVER_AMPLITUDE);
@@ -287,6 +423,8 @@ export function bootstrap(): void {
         amplitude: MOVER_AMPLITUDE,
         omega,
         phase,
+        anchorX: startX,
+        anchorZ: startZ,
       };
       movers.push(spec);
       writeMoverMatrix(mesh, spec.handle, transform.x, transform.z, 0);
@@ -315,6 +453,8 @@ export function bootstrap(): void {
 
   // --- город (меши по чанкам) ----------------------------------------------
   const cityView = createCityView(scene, world.config);
+  const vehicleView = createVehicleView(scene, { maxVehicles: 96 });
+  const playerView = createPlayerView(scene);
 
   // --- камера --------------------------------------------------------------
   const followCamera = new FollowCamera({
@@ -336,8 +476,11 @@ export function bootstrap(): void {
     followCamera.frustum.near,
     followCamera.frustum.far,
   );
-  followCamera.snapTo(car.x, car.z);
-  applyCamera();
+  followCamera.snapTo(spawn.x, spawn.z);
+
+  let shakeTime = 0;
+  let shakePower = 0;
+  let shakePhase = 0;
 
   function applyCamera(): void {
     const bounds = world.bounds;
@@ -346,105 +489,136 @@ export function bootstrap(): void {
     followCamera.position.z = clamp(followCamera.position.z, bounds.minZ, bounds.maxZ);
     followCamera.target.x = clamp(followCamera.target.x, bounds.minX, bounds.maxX);
     followCamera.target.z = clamp(followCamera.target.z, bounds.minZ, bounds.maxZ);
-    camera.position.set(followCamera.position.x, followCamera.position.y, followCamera.position.z);
-    camera.lookAt(followCamera.target.x, followCamera.target.y, followCamera.target.z);
+
+    let offsetX = 0;
+    let offsetZ = 0;
+    if (shakeTime > 0) {
+      offsetX = Math.sin(shakePhase * 1.7) * shakePower * SHAKE_SCALE;
+      offsetZ = Math.cos(shakePhase * 1.3) * shakePower * SHAKE_SCALE;
+    }
+    camera.position.set(
+      followCamera.position.x + offsetX,
+      followCamera.position.y,
+      followCamera.position.z + offsetZ,
+    );
+    camera.lookAt(
+      followCamera.target.x + offsetX * 0.4,
+      followCamera.target.y,
+      followCamera.target.z + offsetZ * 0.4,
+    );
   }
 
-  // --- физика машины -------------------------------------------------------
-  let speedKmh = 0;
-  const carBody: CircleBody = { x: car.x, z: car.z, vx: 0, vz: 0, radius: CAR_RADIUS };
-  const solveResult: SolveResult = { hit: false, contacts: 0, impact: 0, substeps: 0 };
-  const moverBody: Rect = { x: 0, z: 0, hx: MOVER_HALF, hz: MOVER_HALF, angle: 0 };
-  const spawnQuery: SpawnPoint[] = [];
+  applyCamera();
 
-  /** Респавн берётся из querySpawnPoints, а не из константы (M3-A-05). */
-  function pickRespawn(): SpawnPoint {
-    world.querySpawnPoints(car.x, car.z, 450, 'car', spawnQuery);
+  // --- физика машин и игрок -------------------------------------------------
+  const audio = createVehicleAudio();
+  const physics = new VehiclePhysics(registry, fleet, colliderHash, TUNING, world.bounds, audio);
+  const playerController = new PlayerController(
+    fleet,
+    colliderHash,
+    TUNING,
+    world.bounds,
+    player.id,
+    playerTransform,
+  );
+  playerController.startInVehicle(startVehicle);
+
+  const spawnQuery: SpawnPoint[] = [];
+  /** Запас к габариту при проверке свободного места под респавн, м. */
+  const RESPAWN_MARGIN = 0.35;
+
+  /**
+   * Респавн: точка дорожного графа, свободная под габарит активной цели.
+   * querySpawnPoints проверяет только 0.6 м (BUG-M4-004), поэтому здесь
+   * дополнительно фильтруем по радиусу машины/игрока через SpatialHash.
+   */
+  function pickRespawn(x: number, z: number, radius: number): SpawnPoint {
+    const minSeparation = (radius * 2 + 3) * (radius * 2 + 3);
+    world.querySpawnPoints(x, z, 450, 'car', spawnQuery);
     let best: SpawnPoint | null = null;
     let fallback: SpawnPoint | null = null;
     let bestDist = Number.POSITIVE_INFINITY;
+    let fallbackDist = Number.POSITIVE_INFINITY;
     for (let i = 0; i < spawnQuery.length; i += 1) {
       const point = spawnQuery[i];
-      if (!fallback) fallback = point;
-      const dx = point.x - car.x;
-      const dz = point.z - car.z;
+      if (!placementFree(point.x, point.z, radius + RESPAWN_MARGIN)) continue;
+      const dx = point.x - x;
+      const dz = point.z - z;
       const dist = dx * dx + dz * dz;
-      if (dist < 100) continue; // не телепортируем на текущее место
+      if (dist < fallbackDist) {
+        fallbackDist = dist;
+        fallback = point;
+      }
+      if (dist < minSeparation) continue; // не телепортируем на текущее место
       if (dist < bestDist) {
         bestDist = dist;
         best = point;
       }
     }
-    return best ?? fallback ?? world.defaultSpawn;
-  }
+    if (best) return best;
+    if (fallback) return fallback;
 
-  function resetCar(): void {
-    const point = pickRespawn();
-    car.x = point.x;
-    car.z = point.z;
-    car.heading = point.heading;
-    car.vx = 0;
-    car.vz = 0;
-    car.prevX = point.x;
-    car.prevZ = point.z;
-    car.prevHeading = point.heading;
-    speedKmh = 0;
-    followCamera.snapTo(car.x, car.z);
-    world.prefetch(car.x, car.z);
-  }
-
-  function updateCar(dt: number): void {
-    car.prevX = car.x;
-    car.prevZ = car.z;
-    car.prevHeading = car.heading;
-
-    input.read(inputState);
-    if (inputState.reset) resetCar();
-
-    const throttle = inputState.throttle > 0.5 ? 1 : 0;
-    const braking = inputState.brake > 0.5 ? 1 : 0;
-    const steerInput = inputState.steer;
-    const handbrake = inputState.handbrake;
-
-    const sin = Math.sin(car.heading);
-    const cos = Math.cos(car.heading);
-
-    let forward = car.vx * sin + car.vz * cos;
-    let lateral = car.vx * cos - car.vz * sin;
-
-    if (throttle > 0) forward += CAR_TUNING.accel * dt;
-    if (braking > 0) {
-      if (forward > 0.5) forward -= CAR_TUNING.brake * dt;
-      else forward -= CAR_TUNING.accel * 0.65 * dt;
+    // Страховка, если querySpawnPoints всё отсёк: сырые точки дорожного графа.
+    const raw = world.roadGraph.spawnPoints;
+    let rawBest: SpawnPoint | null = null;
+    let rawBestDist = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < raw.length; i += 1) {
+      const point = raw[i];
+      if (!placementFree(point.x, point.z, radius + RESPAWN_MARGIN)) continue;
+      const dx = point.x - x;
+      const dz = point.z - z;
+      const dist = dx * dx + dz * dz;
+      if (dist < rawBestDist) {
+        rawBestDist = dist;
+        rawBest = point;
+      }
     }
-
-    forward -= forward * 0.55 * dt;
-    forward -= Math.sign(forward) * Math.min(Math.abs(forward), 2.2 * dt);
-    forward = clamp(forward, -CAR_TUNING.maxReverse, CAR_TUNING.maxSpeed);
-
-    const steerFactor = Math.min(1, Math.abs(forward) / 6);
-    car.heading += steerInput * CAR_TUNING.steerRate * dt * steerFactor * (forward < 0 ? -1 : 1);
-
-    lateral *= Math.exp(-(handbrake ? CAR_TUNING.handbrakeGrip : CAR_TUNING.grip) * dt);
-
-    car.vx = sin * forward + cos * lateral;
-    car.vz = cos * forward - sin * lateral;
-
-    carBody.x = car.x;
-    carBody.z = car.z;
-    carBody.vx = car.vx;
-    carBody.vz = car.vz;
-    moveCircle(carBody, dt, colliderHash, collisionCandidates, contact, TUNING, solveResult);
-
-    // Кламп по world.bounds, а не по старой константе 75 (M3-A-14).
-    const margin = CAR_RADIUS + 1.5;
-    car.x = clamp(carBody.x, world.bounds.minX + margin, world.bounds.maxX - margin);
-    car.z = clamp(carBody.z, world.bounds.minZ + margin, world.bounds.maxZ - margin);
-    car.vx = carBody.vx;
-    car.vz = carBody.vz;
-
-    speedKmh = Math.hypot(car.vx, car.vz) * 3.6;
+    return rawBest ?? world.defaultSpawn;
   }
+
+  /** R: активную цель — на дорогу. Машину заодно ремонтируем и тушим. */
+  function resetActiveTarget(): void {
+    const vehicle = playerController.vehicle;
+    if (playerController.mode === 'driving' && vehicle) {
+      const point = pickRespawn(
+        vehicle.transform.x,
+        vehicle.transform.z,
+        vehicleColliderRadius(vehicle.config),
+      );
+      repositionVehicle(registry, vehicle, point.x, point.z, point.heading);
+      repairVehicleFull(vehicle);
+      playerController.syncInsideVehicle();
+      followCamera.snapTo(point.x, point.z);
+      world.prefetch(point.x, point.z);
+      shakeTime = 0;
+      return;
+    }
+    const point = pickRespawn(playerTransform.x, playerTransform.z, PLAYER.radius + 0.75);
+    playerController.teleport(point.x, point.z);
+    followCamera.snapTo(point.x, point.z);
+    world.prefetch(point.x, point.z);
+    shakeTime = 0;
+  }
+
+  /** E: сесть/выйти. Камера и стриминг переезжают на новую цель. */
+  function toggleVehicle(): boolean {
+    const changed = playerController.toggleVehicle();
+    if (!changed) return false;
+    const vehicle = playerController.vehicle;
+    const target = vehicle ? vehicle.transform : playerTransform;
+    followCamera.snapTo(target.x, target.z);
+    world.prefetch(target.x, target.z);
+    shakeTime = 0;
+    return true;
+  }
+
+  // E не входит в общий InputMap ядра: добавляем одноразовое действие здесь,
+  // чтобы не менять контракт core/input в M4.
+  let interactRequested = false;
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.code === 'KeyE' && !event.repeat) interactRequested = true;
+  };
+  window.addEventListener('keydown', onKeyDown);
 
   // --- стресс-режим: движение кинематических тел ----------------------------
   function updateStressMovers(dt: number): void {
@@ -465,32 +639,37 @@ export function bootstrap(): void {
       const cosPhase = Math.cos(phase);
 
       if (spec.axis === 0) {
-        transform.x = spec.center + sinPhase * spec.amplitude;
-        transform.z = spec.lane + cosPhase * MOVER_WEAVE;
+        transform.x = spec.anchorX + spec.center + sinPhase * spec.amplitude;
+        transform.z = spec.anchorZ + spec.lane + cosPhase * MOVER_WEAVE;
         transform.vx = cosPhase * spec.amplitude * spec.omega;
         transform.vz = -sinPhase * MOVER_WEAVE * spec.omega;
       } else {
-        transform.z = spec.center + sinPhase * spec.amplitude;
-        transform.x = spec.lane + cosPhase * MOVER_WEAVE;
+        transform.z = spec.anchorZ + spec.center + sinPhase * spec.amplitude;
+        transform.x = spec.anchorX + spec.lane + cosPhase * MOVER_WEAVE;
         transform.vz = cosPhase * spec.amplitude * spec.omega;
         transform.vx = -sinPhase * MOVER_WEAVE * spec.omega;
       }
       transform.heading = Math.atan2(transform.vx, transform.vz);
 
-      moverBody.x = transform.x;
-      moverBody.z = transform.z;
-      moverBody.angle = transform.heading;
-      if (resolveRectBody(moverBody, colliderHash, collisionCandidates, contact, TUNING, true)) {
-        transform.x = moverBody.x;
-        transform.z = moverBody.z;
+      // Кинематику стресс-режима двигаем и разрешаем через API ядра.
+      const rect = {
+        x: transform.x,
+        z: transform.z,
+        hx: MOVER_HALF,
+        hz: MOVER_HALF,
+        angle: transform.heading,
+      };
+      if (resolveRectBody(rect, colliderHash, collisionCandidates, contact, TUNING, true)) {
+        transform.x = rect.x;
+        transform.z = rect.z;
       }
       registry.updateCollider(spec.id);
     }
   }
 
   function syncStressMovers(alpha: number): void {
-    if (!stressMesh) return;
-    const mesh = stressMesh;
+    const mesh = stressMeshRef;
+    if (!mesh) return;
     for (let i = 0; i < movers.length; i += 1) {
       const spec = movers[i];
       const entity = registry.get(spec.id);
@@ -508,11 +687,11 @@ export function bootstrap(): void {
   }
 
   // --- префетч окружения до первого кадра ----------------------------------
-  const prefetchMs = world.prefetch(car.x, car.z);
+  const prefetchMs = world.prefetch(spawn.x, spawn.z);
   cityView.sync(world);
 
+  // --- отладочный API -------------------------------------------------------
   if (debugWorld) {
-    // layoutHash считается один раз и доступен и в HUD, и в window.__tmc.
     const layoutHash = world.layoutHash;
     const info = world.info;
     frameStats.layoutHash = layoutHash;
@@ -520,6 +699,9 @@ export function bootstrap(): void {
     frameStats.roads = info.roads;
     frameStats.blocks = info.blocks;
     frameStats.landmarks = info.landmarks;
+
+    const activeVehicle = (): VehicleState | null => playerController.vehicle ?? fleet.list[0] ?? null;
+
     window.__tmc = {
       mapId: world.mapId,
       seed,
@@ -549,87 +731,442 @@ export function bootstrap(): void {
           drawCalls: renderer.info.render.calls,
           triangles: renderer.info.render.triangles,
           prefetchMs,
+          vehicles: fleet.size,
+          mode: playerController.mode,
+          onFoot: playerController.mode === 'foot' ? 1 : 0,
+          hp: playerController.vehicle ? Number(playerController.vehicle.hp.toFixed(1)) : 0,
+          type: playerController.vehicle ? playerController.vehicle.type : '',
+          physMaxMs: Number(frameStats.physMaxMs.toFixed(3)),
+          logicSteps,
+          inputReads,
         };
       },
       teleport: (x, z) => {
-        const margin = CAR_RADIUS + 1.5;
-        car.x = clamp(x, world.bounds.minX + margin, world.bounds.maxX - margin);
-        car.z = clamp(z, world.bounds.minZ + margin, world.bounds.maxZ - margin);
-        car.vx = 0;
-        car.vz = 0;
-        car.prevX = car.x;
-        car.prevZ = car.z;
-        followCamera.snapTo(car.x, car.z);
-        world.prefetch(car.x, car.z);
+        const margin = 3;
+        const targetX = clamp(x, world.bounds.minX + margin, world.bounds.maxX - margin);
+        const targetZ = clamp(z, world.bounds.minZ + margin, world.bounds.maxZ - margin);
+        const vehicle = playerController.vehicle;
+        if (playerController.mode === 'driving' && vehicle) {
+          repositionVehicle(registry, vehicle, targetX, targetZ, vehicle.transform.heading);
+        } else {
+          playerController.teleport(targetX, targetZ);
+        }
+        followCamera.snapTo(targetX, targetZ);
+        world.prefetch(targetX, targetZ);
+        shakeTime = 0;
       },
-      carState: () => ({
-        x: Number(car.x.toFixed(2)),
-        z: Number(car.z.toFixed(2)),
-        heading: Number(car.heading.toFixed(3)),
-        speedKmh: Number(speedKmh.toFixed(1)),
-      }),
+      carState: (): Record<string, number | string> => {
+        const vehicle = activeVehicle();
+        const onFoot = playerController.mode === 'foot';
+        const playerSpeed = Math.hypot(playerTransform.vx, playerTransform.vz) * 3.6;
+        if (!vehicle) {
+          return {
+            vehicles: fleet.size,
+            mode: playerController.mode,
+            onFoot: onFoot ? 1 : 0,
+            hp: 0,
+            type: '',
+            x: Number(playerTransform.x.toFixed(2)),
+            z: Number(playerTransform.z.toFixed(2)),
+            speedKmh: Number(playerSpeed.toFixed(1)),
+            playerX: Number(playerTransform.x.toFixed(2)),
+            playerZ: Number(playerTransform.z.toFixed(2)),
+            playerSpeedKmh: Number(playerSpeed.toFixed(1)),
+            physMaxMs: Number(frameStats.physMaxMs.toFixed(3)),
+          };
+        }
+        const transform = vehicle.transform;
+        const carSpeed = Math.hypot(transform.vx, transform.vz) * 3.6;
+        const radius = vehicleColliderRadius(vehicle.config);
+        const clear = onFoot
+          ? placementFree(playerTransform.x, playerTransform.z, PLAYER.radius)
+          : placementFreeExcept(transform.x, transform.z, radius, -vehicle.id - 1);
+        return {
+          id: vehicle.id,
+          type: vehicle.type,
+          name: vehicle.config.label,
+          // x/z/speed — активная цель: машина под управлением или пешеход.
+          x: Number((onFoot ? playerTransform.x : transform.x).toFixed(2)),
+          z: Number((onFoot ? playerTransform.z : transform.z).toFixed(2)),
+          heading: Number((onFoot ? playerTransform.heading : transform.heading).toFixed(3)),
+          speedKmh: Number((onFoot ? playerSpeed : carSpeed).toFixed(1)),
+          carX: Number(transform.x.toFixed(2)),
+          carZ: Number(transform.z.toFixed(2)),
+          carSpeedKmh: Number(carSpeed.toFixed(1)),
+          playerX: Number(playerTransform.x.toFixed(2)),
+          playerZ: Number(playerTransform.z.toFixed(2)),
+          playerSpeedKmh: Number(playerSpeed.toFixed(1)),
+          forward: Number(vehicle.forward.toFixed(2)),
+          lateral: Number(vehicle.lateral.toFixed(2)),
+          slip: Number(vehicle.slip.toFixed(2)),
+          hp: Number(vehicle.hp.toFixed(1)),
+          maxHp: vehicle.maxHp,
+          hpPct: Number(((vehicle.hp / vehicle.maxHp) * 100).toFixed(1)),
+          wrecked: vehicle.wrecked ? 1 : 0,
+          driver: vehicle.driver,
+          mode: playerController.mode,
+          onFoot: onFoot ? 1 : 0,
+          vehicles: fleet.size,
+          physMaxMs: Number(frameStats.physMaxMs.toFixed(3)),
+          staticClear: placementFreeStatic(transform.x, transform.z, radius) ? 1 : 0,
+          spawnClear: clear ? 1 : 0,
+        };
+      },
+      vehicleStats: () => {
+        const counts: Record<VehicleTypeId, number> = {
+          sedan: 0,
+          sports: 0,
+          van: 0,
+          truck: 0,
+          police: 0,
+        };
+        for (let i = 0; i < fleet.list.length; i += 1) counts[fleet.list[i].type] += 1;
+        const vehicle = playerController.vehicle;
+        return {
+          total: fleet.size,
+          sedan: counts.sedan,
+          sports: counts.sports,
+          van: counts.van,
+          truck: counts.truck,
+          police: counts.police,
+          mode: playerController.mode,
+          onFoot: playerController.mode === 'foot' ? 1 : 0,
+          target: vehicle ? vehicle.config.label : 'Пешеход',
+          targetType: vehicle ? vehicle.type : '',
+          hp: vehicle ? Number(vehicle.hp.toFixed(1)) : 0,
+          physMaxMs: Number(frameStats.physMaxMs.toFixed(3)),
+        };
+      },
+      spawnVehicle: (type, x, z, heading) => {
+        const vehicleType = type !== undefined && isVehicleType(type) ? type : 'sedan';
+        let px: number;
+        let pz: number;
+        let ph: number;
+        if (x !== undefined && z !== undefined && Number.isFinite(x) && Number.isFinite(z)) {
+          px = x;
+          pz = z;
+          ph = heading ?? 0;
+        } else {
+          const point = pickRespawn(playerTransform.x, playerTransform.z, CITY_CAR_CLEAR_RADIUS);
+          px = point.x;
+          pz = point.z;
+          ph = point.heading;
+        }
+        if (!placementFree(px, pz, CITY_CAR_CLEAR_RADIUS)) return -1;
+        createVehicle(fleet, registry, { type: vehicleType, x: px, z: pz, heading: ph });
+        return fleet.size;
+      },
+      damageActive: (amount) => {
+        const vehicle = activeVehicle();
+        if (!vehicle) return 0;
+        return damageVehicle(vehicle, amount) ? 1 : 0;
+      },
+      repairActive: () => {
+        const vehicle = activeVehicle();
+        if (!vehicle) return;
+        repairVehicleFull(vehicle);
+      },
+      enterVehicle: () => (playerController.enterNearest() ? 1 : 0),
+      exitVehicle: () => (playerController.exitVehicle() ? 1 : 0),
+      speedProbe: () => {
+        const result: Record<string, number | string> = {};
+        const seconds = 20;
+        const steps = Math.ceil(seconds / TUNING.fixedStep);
+        for (let t = 0; t < VEHICLE_TYPES.length; t += 1) {
+          const type = VEHICLE_TYPES[t];
+          // Пустой хэш: замер только продольной модели, без стен и трафика.
+          const probeHash = new SpatialHash<Collider>(TUNING.spatialCellSize);
+          const probeRegistry = new EntityRegistry(probeHash);
+          const probeFleet = new VehicleFleet();
+          const probePhysics = new VehiclePhysics(probeRegistry, probeFleet, probeHash, TUNING, null);
+          const car = createVehicle(probeFleet, probeRegistry, { type, x: 0, z: 0, heading: 0 });
+          let maxReached = 0;
+          let timeToMax = -1;
+          for (let i = 0; i < steps; i += 1) {
+            probePhysics.step(car, FULL_THROTTLE, TUNING.fixedStep);
+            const speed = Math.hypot(car.transform.vx, car.transform.vz);
+            if (speed > maxReached) maxReached = speed;
+            if (timeToMax < 0 && speed >= car.config.maxSpeed - 0.05) {
+              timeToMax = (i + 1) * TUNING.fixedStep;
+            }
+          }
+          result[type] = Number(maxReached.toFixed(2));
+          result[`${type}Max`] = car.config.maxSpeed;
+          result[`${type}Reached`] = timeToMax >= 0 ? 1 : 0;
+          result[`${type}Time`] = Number(timeToMax.toFixed(2));
+        }
+        return result;
+      },
+      stressState: () => {
+        let maxDistance = 0;
+        for (let i = 0; i < movers.length; i += 1) {
+          const spec = movers[i];
+          const entity = registry.get(spec.id);
+          if (!entity) continue;
+          const distance = Math.hypot(
+            entity.transform.x - spec.anchorX,
+            entity.transform.z - spec.anchorZ,
+          );
+          if (distance > maxDistance) maxDistance = distance;
+        }
+        return {
+          active: stressEnabled ? 1 : 0,
+          movers: movers.length,
+          anchorX: Number(startX.toFixed(2)),
+          anchorZ: Number(startZ.toFixed(2)),
+          maxDistance: Number(maxDistance.toFixed(2)),
+        };
+      },
+      physicsBench: (count = 60, ticks = 120) => {
+        const points: SpawnPoint[] = [];
+        world.querySpawnPoints(0, 0, 5000, 'car', points);
+        const created: VehicleState[] = [];
+        // Габарит самой крупной машины + запас: не ставим 60 машин в кластер
+        // из точек, проверенных лишь по 0.6 м (BUG-M4-004).
+        const benchRadius = 3;
+        for (let i = 0; i < points.length && created.length < count; i += 1) {
+          const point = points[i];
+          if (!placementFree(point.x, point.z, benchRadius)) continue;
+          const vehicle = createVehicle(fleet, registry, {
+            type: VEHICLE_TYPES[created.length % VEHICLE_TYPES.length],
+            x: point.x,
+            z: point.z,
+            heading: point.heading,
+          });
+          const sin = Math.sin(point.heading);
+          const cos = Math.cos(point.heading);
+          vehicle.transform.vx = sin * 12;
+          vehicle.transform.vz = cos * 12;
+          created.push(vehicle);
+        }
+        const total = created.length;
+
+        // Прогрев: первые шаги включают ветки контактов.
+        for (let tick = 0; tick < 5; tick += 1) {
+          for (let i = 0; i < created.length; i += 1) {
+            physics.step(created[i], IDLE_VEHICLE_INPUT, TUNING.fixedStep);
+          }
+        }
+
+        // Прогрев: первые шаги включают ветки контактов.
+        for (let tick = 0; tick < 5; tick += 1) {
+          for (let i = 0; i < created.length; i += 1) {
+            physics.step(created[i], IDLE_VEHICLE_INPUT, TUNING.fixedStep);
+          }
+        }
+
+        let totalMs = 0;
+        let maxMs = 0;
+        const samples: number[] = [];
+        for (let tick = 0; tick < ticks; tick += 1) {
+          const started = performance.now();
+          for (let i = 0; i < created.length; i += 1) {
+            physics.step(created[i], IDLE_VEHICLE_INPUT, TUNING.fixedStep);
+          }
+          const elapsed = performance.now() - started;
+          totalMs += elapsed;
+          samples.push(elapsed);
+          if (elapsed > maxMs) maxMs = elapsed;
+        }
+
+        for (let i = 0; i < created.length; i += 1) {
+          destroyVehicle(fleet, registry, created[i]);
+        }
+        registry.flush();
+
+        const avgMs = ticks > 0 ? totalMs / ticks : 0;
+        samples.sort((a, b) => a - b);
+        const percentile = (q: number): number => {
+          if (samples.length === 0) return 0;
+          const index = Math.min(samples.length - 1, Math.floor(q * samples.length));
+          return samples[index];
+        };
+        return {
+          vehicles: total,
+          ticks,
+          avgMs: Number(avgMs.toFixed(3)),
+          maxMs: Number(maxMs.toFixed(3)),
+          p50Ms: Number(percentile(0.5).toFixed(3)),
+          p95Ms: Number(percentile(0.95).toFixed(3)),
+          p99Ms: Number(percentile(0.99).toFixed(3)),
+          perCarMs: Number((total > 0 ? avgMs / total : 0).toFixed(4)),
+        };
+      },
     };
+  }
+
+  /**
+   * Отладочный урон идёт через публичный API сущности, чтобы дым и wrecked
+   * обновились штатно.
+   */
+  // --- HUD ------------------------------------------------------------------
+  let hudTimer = 0;
+  let lastHint = '';
+
+  function updateHud(): void {
+    if (!hintElement) return;
+    const vehicle = playerController.mode === 'driving' ? playerController.vehicle : null;
+    let text: string;
+    if (vehicle) {
+      const speed = Math.round(Math.hypot(vehicle.transform.vx, vehicle.transform.vz) * 3.6);
+      const hp = Math.round((vehicle.hp / vehicle.maxHp) * 100);
+      const state = vehicle.wrecked ? ' · уничтожена' : '';
+      text = `${vehicle.config.label} · ${vehicle.type} · HP ${hp}%${state} · ${speed} км/ч · E — выйти · R — на дорогу`;
+    } else {
+      const nearest = playerController.nearest;
+      const carHint = nearest ? ` · рядом: ${nearest.config.label}` : '';
+      text = `Пешком · E — сесть в машину${carHint} · WASD — идти · R — на дорогу`;
+    }
+    if (text !== lastHint) {
+      hintElement.textContent = text;
+      lastHint = text;
+    }
   }
 
   // --- фикс. шаг ------------------------------------------------------------
   let logicMsSum = 0;
   let logicSamples = 0;
+  let logicMsMax = 0;
+  let physMsMax = 0;
+  let logicSteps = 0;
+  let inputReads = 0;
   let streamTimer = 0;
+
+  function activeTargetTransform(): { x: number; z: number; vx: number; vz: number } {
+    const vehicle = playerController.vehicle;
+    if (playerController.mode === 'driving' && vehicle) return vehicle.transform;
+    return playerTransform;
+  }
 
   function step(dt: number): void {
     const started = performance.now();
-    updateCar(dt);
+    // BUG-M4-006: ввод читается ровно один раз за фиксированный шаг.
+    // Все системы получают уже готовый inputState, повторных read() нет.
+    input.read(inputState);
+    inputReads += 1;
+    logicSteps += 1;
+    if (inputState.reset) resetActiveTarget();
+
+    if (interactRequested) {
+      interactRequested = false;
+      toggleVehicle();
+    }
+
+    if (playerController.mode === 'driving') playerController.syncInsideVehicle();
+    else playerController.stepFoot(dt, inputState);
+
+    const driven = playerController.mode === 'driving' ? playerController.vehicle : null;
+    const physicsStarted = performance.now();
+    for (let i = 0; i < fleet.list.length; i += 1) {
+      const vehicle = fleet.list[i];
+      physics.step(vehicle, vehicle === driven ? inputState : IDLE_VEHICLE_INPUT, dt);
+    }
+    const physicsMs = performance.now() - physicsStarted;
+    if (physicsMs > physMsMax) physMsMax = physicsMs;
     updateStressMovers(dt);
+
+    // Импульс активной машины → тряска камеры; взрывы → вспышка без крови.
+    if (driven && driven.impactPulse > 0) {
+      shakePower = clamp(driven.impactPulse / 18, 0.2, SHAKE_MAX);
+      shakeTime = SHAKE_DURATION;
+      driven.impactPulse = 0;
+    }
+    for (let i = 0; i < fleet.list.length; i += 1) {
+      const vehicle = fleet.list[i];
+      if (!vehicle.justWrecked) continue;
+      vehicle.justWrecked = false;
+      vehicleView.burst(vehicle.transform.x, vehicle.transform.z, 1);
+      if (vehicle === driven) {
+        shakePower = SHAKE_MAX;
+        shakeTime = SHAKE_DURATION;
+      }
+    }
+
     registry.flush();
 
     streamTimer += dt;
     if (streamTimer >= STREAM_INTERVAL) {
       streamTimer = 0;
-      world.update(car.x, car.z);
+      const target = activeTargetTransform();
+      world.update(target.x, target.z);
     }
 
-    logicMsSum += performance.now() - started;
+    const stepMs = performance.now() - started;
+    logicMsSum += stepMs;
     logicSamples += 1;
+    if (stepMs > logicMsMax) logicMsMax = stepMs;
   }
 
   // --- рендер кадра --------------------------------------------------------
   function renderFrame(alpha: number, frameDt: number): void {
-    const x = lerp(car.prevX, car.x, alpha);
-    const z = lerp(car.prevZ, car.z, alpha);
-    const heading = lerpAngle(car.prevHeading, car.heading, alpha);
+    // Интерполяция для рендера: активная цель (машина или пешеход).
+    const target =
+      playerController.mode === 'driving' && playerController.vehicle
+        ? playerController.vehicle.transform
+        : playerTransform;
+    const renderX = lerp(target.prevX, target.x, alpha);
+    const renderZ = lerp(target.prevZ, target.z, alpha);
 
-    carGroup.position.set(x, 0, z);
-    carGroup.rotation.y = heading;
+    vehicleView.sync(fleet.list, alpha, frameDt);
+    const footX = lerp(playerTransform.prevX, playerTransform.x, alpha);
+    const footZ = lerp(playerTransform.prevZ, playerTransform.z, alpha);
+    const footHeading = lerpAngle(playerTransform.prevHeading, playerTransform.heading, alpha);
+    playerView.sync(footX, footZ, footHeading, playerController.mode === 'foot');
 
     syncStressMovers(alpha);
     cityView.sync(world);
 
-    followCamera.update(frameDt, x, z, car.vx, car.vz);
+    if (shakeTime > 0) {
+      shakeTime = Math.max(0, shakeTime - frameDt);
+      shakePhase += frameDt * 46;
+      if (shakeTime === 0) shakePower = 0;
+    }
+
+    followCamera.update(frameDt, renderX, renderZ, target.vx, target.vz);
     applyCamera();
 
-    sun.position.set(x + 55, 105, z + 40);
-    sun.target.position.set(x, 0, z);
+    sun.position.set(renderX + 55, 105, renderZ + 40);
+    sun.target.position.set(renderX, 0, renderZ);
     sun.target.updateMatrixWorld();
 
     renderer.render(scene, camera);
 
     const info = renderer.info.render;
     const worldStats = world.stats;
-    frameStats.drawCalls = info.calls;
+    const vehicle = playerController.vehicle;
+    const speed = vehicle
+      ? Math.hypot(vehicle.transform.vx, vehicle.transform.vz) * 3.6
+      : Math.hypot(playerTransform.vx, playerTransform.vz) * 3.6;    frameStats.drawCalls = info.calls;
     frameStats.triangles = info.triangles;
-    frameStats.speedKmh = speedKmh;
+    frameStats.speedKmh = speed;
     frameStats.colliders = colliderHash.size;
     frameStats.movingColliders = registry.dynamicColliders;
     frameStats.entities = registry.total;
     frameStats.overrun = loop.overrun;
     frameStats.debtMs = loop.debt * 1000;
     frameStats.logicMs = logicSamples > 0 ? logicMsSum / logicSamples : 0;
+    frameStats.logicMaxMs = logicMsMax;
+    frameStats.physMaxMs = physMsMax;
     frameStats.chunks = world.activeChunks.length;
     frameStats.chunkGenMaxMs = worldStats.genMaxMs;
     frameStats.chunkGenLastMs = worldStats.genLastMs;
     frameStats.worldUpdateMs = worldStats.updateMs;
+    frameStats.vehicles = fleet.size;
+    frameStats.playerMode = playerController.mode === 'driving' ? 'car' : 'onFoot';
+    frameStats.targetLabel = vehicle
+      ? `${vehicle.config.label} [${vehicle.type}] #${vehicle.handle}`
+      : 'Пешеход';
+    frameStats.vehicleHp = vehicle ? (vehicle.hp / vehicle.maxHp) * 100 : 100;
     logicMsSum = 0;
     logicSamples = 0;
+    logicMsMax = 0;
+    physMsMax = 0;
+
+    hudTimer -= frameDt;
+    if (hudTimer <= 0) {
+      hudTimer = HUD_INTERVAL;
+      updateHud();
+    }
 
     debug.update(frameDt, frameStats);
   }
@@ -680,6 +1217,7 @@ export function bootstrap(): void {
   const loadingElement = document.getElementById('loading');
   if (loadingElement) loadingElement.classList.add('hidden');
 
+  updateHud();
   loop.start();
   if (document.hidden) setPaused(true);
 }

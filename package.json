@@ -1,7 +1,7 @@
 {
   "name": "take-my-car",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "TakeMyCar — аркадная 3D-игра с видом сверху: город, угон машин, погони.",
   "type": "module",
   "scripts": {

@@ -24,6 +24,10 @@ export interface DebugFrameStats {
   debtMs: number;
   /** Время последнего фикс. шага логики, мс. */
   logicMs: number;
+  /** Максимум времени фикс. шага за окно оверлея, мс (не среднее). */
+  logicMaxMs: number;
+  /** Максимум времени чистой физики машин за окно, мс (BUG-M4-003). */
+  physMaxMs: number;
   /** Активных чанков мира. */
   chunks: number;
   /** Максимум генерации чанка за сеанс, мс (не среднее). */
@@ -48,6 +52,14 @@ export interface DebugFrameStats {
   showWorld: boolean;
   /** Активен ли стресс-режим (?stress=1). */
   stressActive: boolean;
+  /** Живых машин. */
+  vehicles: number;
+  /** Активная цель: машина или игрок. */
+  targetLabel: string;
+  /** Режим игрока: car/foot. */
+  playerMode: string;
+  /** HP активной машины, %. */
+  vehicleHp: number;
 }
 
 export function createDebugStats(): DebugFrameStats {
@@ -61,6 +73,8 @@ export function createDebugStats(): DebugFrameStats {
     overrun: 0,
     debtMs: 0,
     logicMs: 0,
+    logicMaxMs: 0,
+    physMaxMs: 0,
     chunks: 0,
     chunkGenMaxMs: 0,
     chunkGenLastMs: 0,
@@ -73,6 +87,10 @@ export function createDebugStats(): DebugFrameStats {
     layoutHash: 0,
     showWorld: false,
     stressActive: false,
+    vehicles: 0,
+    targetLabel: '',
+    playerMode: '',
+    vehicleHp: 0,
   };
 }
 
@@ -104,7 +122,10 @@ export class DebugOverlay {
     const logicMs = this.logicMsSum / this.frames;
 
     let text =
-      `fps ${Math.round(fps)}   frame ${frameMs.toFixed(1)} ms   logic ${logicMs.toFixed(2)} ms   speed ${Math.round(stats.speedKmh)} km/h\n` +
+      `fps ${Math.round(fps)}   frame ${frameMs.toFixed(1)} ms   logic ${logicMs.toFixed(2)} ms` +
+      ` (max ${stats.logicMaxMs.toFixed(2)})   phys max ${stats.physMaxMs.toFixed(2)} ms` +
+      `   speed ${Math.round(stats.speedKmh)} km/h\n` +
+      `vehicles ${stats.vehicles}   target ${stats.targetLabel} (${stats.playerMode})   hp ${Math.round(stats.vehicleHp)}%\n` +
       `draw calls ${stats.drawCalls}   tris ${(stats.triangles / 1000).toFixed(1)}k   ` +
       `colliders ${stats.colliders} (dyn ${stats.movingColliders})   entities ${stats.entities}\n` +
       `overrun ${stats.overrun} steps   debt ${stats.debtMs.toFixed(0)} ms`;
