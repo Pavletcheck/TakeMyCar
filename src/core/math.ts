@@ -190,17 +190,25 @@ export function circleRect(cx: number, cz: number, radius: number, rect: Rect, c
 
 /**
  * Пересечение двух прямоугольников через SAT (4 оси: по две с каждого).
- * Работает и для повёрнутых прямоугольников, ничего не аллоцирует.
+ * Заполняет contact минимальной осью проникновения: нормаль направлена
+ * от `b` к `a` (как у circleRect), глубина — перекрытие по этой оси.
+ *
+ * Используется решателем: `a` сдвигается на `n * depth`, чтобы выйти из `b`.
+ * Ничего не аллоцирует.
  */
-export function rectRect(a: Rect, b: Rect): boolean {
+export function rectRectContact(a: Rect, b: Rect, contact: Contact): boolean {
   const aAngle = a.angle ?? 0;
   const bAngle = b.angle ?? 0;
   const ac = Math.cos(aAngle);
   const as = Math.sin(aAngle);
   const bc = Math.cos(bAngle);
   const bs = Math.sin(bAngle);
-  const dx = b.x - a.x;
-  const dz = b.z - a.z;
+  const dx = a.x - b.x;
+  const dz = a.z - b.z;
+
+  let minOverlap = Number.POSITIVE_INFINITY;
+  let minUx = 1;
+  let minUz = 0;
 
   for (let axis = 0; axis < 4; axis += 1) {
     let ux: number;
@@ -219,12 +227,33 @@ export function rectRect(a: Rect, b: Rect): boolean {
       uz = bc;
     }
 
-    const distance = Math.abs(dx * ux + dz * uz);
+    const projected = dx * ux + dz * uz;
     const radiusA = a.hx * Math.abs(ac * ux + as * uz) + a.hz * Math.abs(-as * ux + ac * uz);
     const radiusB = b.hx * Math.abs(bc * ux + bs * uz) + b.hz * Math.abs(-bs * ux + bc * uz);
+    const overlap = radiusA + radiusB - Math.abs(projected);
 
-    if (distance > radiusA + radiusB) return false;
+    if (overlap < 0) return false;
+
+    if (overlap < minOverlap) {
+      minOverlap = overlap;
+      // Нормаль от b к a: знак проекции вектора (a - b) на ось.
+      const sign = projected < 0 ? -1 : 1;
+      minUx = ux * sign;
+      minUz = uz * sign;
+    }
   }
 
+  contact.nx = minUx;
+  contact.nz = minUz;
+  contact.depth = minOverlap;
   return true;
+}
+
+// Переиспользуемый контакт для boolean-варианта: rectRect не вызывается
+// из rectRectContact, поэтому вложенного использования буфера нет.
+const rectRectScratch: Contact = { nx: 0, nz: 0, depth: 0 };
+
+/** Пересечение двух прямоугольников (boolean-вариант контракта). */
+export function rectRect(a: Rect, b: Rect): boolean {
+  return rectRectContact(a, b, rectRectScratch);
 }

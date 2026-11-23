@@ -11,6 +11,8 @@ export interface SpatialItem {
   z: number;
   hx: number;
   hz: number;
+  /** Поворот вокруг центра, радианы. Хэш расширяет ячейки до мирового AABB. */
+  angle?: number;
 }
 
 interface HashRecord<T extends SpatialItem> {
@@ -126,10 +128,17 @@ export class SpatialHash<T extends SpatialItem> {
 
   private addToCells(record: HashRecord<T>): void {
     const item = record.item;
-    const minCellX = Math.floor((item.x - item.hx) * this.cellSizeInv);
-    const maxCellX = Math.floor((item.x + item.hx) * this.cellSizeInv);
-    const minCellZ = Math.floor((item.z - item.hz) * this.cellSizeInv);
-    const maxCellZ = Math.floor((item.z + item.hz) * this.cellSizeInv);
+    // Повёрнутый прямоугольник покрывается мировым AABB: ячейки не должны
+    // терять углы OBB, иначе запрос рядом с углом не вернёт коллайдер.
+    const angle = item.angle ?? 0;
+    const cos = Math.abs(Math.cos(angle));
+    const sin = Math.abs(Math.sin(angle));
+    const extentX = item.hx * cos + item.hz * sin;
+    const extentZ = item.hx * sin + item.hz * cos;
+    const minCellX = Math.floor((item.x - extentX) * this.cellSizeInv);
+    const maxCellX = Math.floor((item.x + extentX) * this.cellSizeInv);
+    const minCellZ = Math.floor((item.z - extentZ) * this.cellSizeInv);
+    const maxCellZ = Math.floor((item.z + extentZ) * this.cellSizeInv);
 
     record.minCellX = minCellX;
     record.maxCellX = maxCellX;
@@ -160,7 +169,8 @@ export class SpatialHash<T extends SpatialItem> {
           bucket[index] = bucket[bucket.length - 1];
           bucket.pop();
         }
-        if (bucket.length === 0) this.cells.delete(key);
+        // Пустые массивы ячеек не удаляем: иначе движущийся коллайдер
+        // пересоздаёт их каждый тик и аллоцирует в горячем пути.
       }
     }
   }

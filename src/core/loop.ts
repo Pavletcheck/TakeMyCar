@@ -1,7 +1,8 @@
 // ---------------------------------------------------------------------------
 // Игровой цикл: фиксированный шаг 60 Гц + интерполяция рендера.
 // Пауза замораживает симуляцию и сбрасывает накопитель, чтобы после
-// возврата фокуса не было скачка dt. Защита от спирали смерти — maxSteps.
+// возврата фокуса не было скачка dt. Защита от спирали смерти — maxSteps:
+// лишние подшаги отбрасываются, счётчик overrun и долг debt видны в HUD.
 // ---------------------------------------------------------------------------
 
 export type FixedUpdateFn = (dt: number) => void;
@@ -18,6 +19,13 @@ export interface GameLoopOptions {
   maxFrameDelta?: number;
 }
 
+/** Шаг симуляции по умолчанию — 1/60 с (ADR 0002). */
+export const DEFAULT_FIXED_STEP = 1 / 60;
+/** Максимум подшагов на кадр (ADR 0002). */
+export const DEFAULT_MAX_SUBSTEPS = 5;
+/** Максимальная дельта кадра: после сна/вкладки время не догоняем. */
+export const DEFAULT_MAX_FRAME_DELTA = 0.25;
+
 export class GameLoop {
   private readonly fixedUpdate: FixedUpdateFn;
   private readonly renderFrame: RenderFn;
@@ -30,13 +38,15 @@ export class GameLoop {
   private paused = false;
   private lastTime = -1;
   private accumulator = 0;
+  private overrunCount = 0;
+  private debtSeconds = 0;
 
   constructor(fixedUpdate: FixedUpdateFn, renderFrame: RenderFn, options: GameLoopOptions = {}) {
     this.fixedUpdate = fixedUpdate;
     this.renderFrame = renderFrame;
-    this.fixedStep = options.fixedStep ?? 1 / 60;
-    this.maxSteps = options.maxSteps ?? 8;
-    this.maxFrameDelta = options.maxFrameDelta ?? 0.1;
+    this.fixedStep = options.fixedStep ?? DEFAULT_FIXED_STEP;
+    this.maxSteps = options.maxSteps ?? DEFAULT_MAX_SUBSTEPS;
+    this.maxFrameDelta = options.maxFrameDelta ?? DEFAULT_MAX_FRAME_DELTA;
 
     if (!(this.fixedStep > 0)) throw new Error('GameLoop: fixedStep должен быть > 0');
     if (!(this.maxSteps >= 1)) throw new Error('GameLoop: maxSteps должен быть >= 1');
@@ -46,11 +56,23 @@ export class GameLoop {
     return this.paused;
   }
 
+  /** Сколько подшагов отброшено защитой от спирали смерти. */
+  get overrun(): number {
+    return this.overrunCount;
+  }
+
+  /** Накопленный отброшенный долг симуляции, секунды. */
+  get debt(): number {
+    return this.debtSeconds;
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;
     this.lastTime = -1;
     this.accumulator = 0;
+    this.overrunCount = 0;
+    this.debtSeconds = 0;
     this.rafId = requestAnimationFrame(this.tick);
   }
 
@@ -100,8 +122,11 @@ export class GameLoop {
       steps += 1;
     }
 
-    if (steps === this.maxSteps) {
-      // Спираль смерти: не догоняем бесконечно, лишний долг отбрасываем.
+    if (this.accumulator >= this.fixedStep) {
+      // Спираль смерти: лишний долг отбрасываем, но фиксируем в диагностике.
+      const dropped = Math.floor(this.accumulator / this.fixedStep);
+      this.overrunCount += dropped > 0 ? dropped : 1;
+      this.debtSeconds += this.accumulator;
       this.accumulator = 0;
     }
 
