@@ -142,9 +142,10 @@ export function circleRect(cx: number, cz: number, radius: number, rect: Rect, c
   let dx = cx - rect.x;
   let dz = cz - rect.z;
   if (angle !== 0) {
-    // В локальные координаты прямоугольника (обратный поворот).
-    const localX = dx * cos + dz * sin;
-    const localZ = -dx * sin + dz * cos;
+    // В локальные координаты прямоугольника. Угол — это rotation.y в Three,
+    // поэтому обратное преобразование: local = R_y(-angle) * world.
+    const localX = dx * cos - dz * sin;
+    const localZ = dx * sin + dz * cos;
     dx = localX;
     dz = localZ;
   }
@@ -179,8 +180,9 @@ export function circleRect(cx: number, cz: number, radius: number, rect: Rect, c
   }
 
   if (angle !== 0) {
-    const nx = contact.nx * cos - contact.nz * sin;
-    const nz = contact.nx * sin + contact.nz * cos;
+    // Обратно в мир: world = R_y(angle) * normal.
+    const nx = contact.nx * cos + contact.nz * sin;
+    const nz = -contact.nx * sin + contact.nz * cos;
     contact.nx = nx;
     contact.nz = nz;
   }
