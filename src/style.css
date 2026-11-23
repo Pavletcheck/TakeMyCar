@@ -1,0 +1,89 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0d1117;
+  overscroll-behavior: none;
+  touch-action: none;
+}
+
+#game {
+  position: fixed;
+  inset: 0;
+}
+
+#game canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+#hud {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-start;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+}
+
+#stats {
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #e6edf3;
+  font-size: 13px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  white-space: pre;
+}
+
+#hint {
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(13, 17, 23, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #9da7b3;
+  font-size: 13px;
+}
+
+#loading {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: #0d1117;
+  color: #e6edf3;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  transition: opacity 0.4s ease;
+  z-index: 10;
+}
+
+#loading.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  #stats,
+  #hint {
+    font-size: 11px;
+  }
+}
