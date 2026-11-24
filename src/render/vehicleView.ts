@@ -1,14 +1,30 @@
 // ---------------------------------------------------------------------------
-// M4. Визуал машин примитивами (до M7, где будут GLB-модели).
+// M7. Визуал машин: low-poly GLB по типу + LOD1 по дистанции, fallback на
+// примитивы M4 (если GLB не загрузился или включён `?models=0`).
 //
-// Один InstancedMesh на деталь кузова: body / cabin / cargo / accent (мигалка)
-// / колёса / дым / следы шин. Всего ~7 draw calls на любое число машин.
-// Матрицы пишутся по индексу без создания объектов: dummy и цвет
-// переиспользуются, пулы дыма и следов фиксированного размера.
+// Модель = два узла GLB: `paint` (белый, красится инстансом через instanceColor)
+// и `trim` (шины, стёкла, фары — запечённые цвета). На тип — 2 LOD, ёмкость
+// каждого InstancedMesh = maxVehicles, поэтому draw calls не зависят от трафика.
+//
+// Дым и следы шин остались прежними: кольцевые пулы, без аллокаций в кадре.
+// Флаг `?models=1` не нужен: модели включаются сами, когда готовы.
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
 import type { VehicleState } from '../entities/vehicle';
+import { VEHICLE_TYPES } from '../config/vehicles';
+import type { VehicleTypeId } from '../config/vehicles';
+import {
+  CAR_MODEL_URLS,
+  createFlatMaterial,
+  createPartInstances,
+  loadModelParts,
+  modelsDisabled,
+  releaseModels,
+  retainModels,
+} from './modelLibrary';
+import type { ModelParts } from './modelLibrary';
+import { focusDistanceSq } from './viewFocus';
 
 const DEFAULT_MAX_VEHICLES = 96;
 const DEFAULT_MAX_SMOKE = 512;
@@ -16,6 +32,9 @@ const DEFAULT_MAX_SKID = 600;
 
 const CABIN_COLOR = 0x1a2230;
 const SKID_Y = 0.07;
+/** Дальше этого расстояния от игрока машина рисуется LOD1 (≤40 % tris). */
+const CAR_LOD_DISTANCE = 42;
+const CAR_LOD_DISTANCE_SQ = CAR_LOD_DISTANCE * CAR_LOD_DISTANCE;
 
 export interface VehicleView {
   /** Синхронизировать инстансы с флотом. dt — реальное время кадра. */
@@ -31,12 +50,30 @@ export interface VehicleViewStats {
   smoke: number;
   skid: number;
   drawCalls: number;
+  /** Сколько машин нарисовано моделями (остальные — примитивами). */
+  models: number;
+  /** Сколько машин на LOD1. */
+  lod1: number;
 }
 
 export interface VehicleViewOptions {
   maxVehicles?: number;
   maxSmoke?: number;
   maxSkid?: number;
+}
+
+/** Один уровень детализации машины: два InstancedMesh и их пивоты. */
+interface CarBatch {
+  readonly paint: THREE.InstancedMesh | null;
+  readonly trim: THREE.InstancedMesh | null;
+  readonly paintMatrix: THREE.Matrix4;
+  readonly trimMatrix: THREE.Matrix4;
+  count: number;
+}
+
+interface CarRig {
+  readonly lod0: CarBatch;
+  readonly lod1: CarBatch;
 }
 
 export function createVehicleView(scene: THREE.Scene, options: VehicleViewOptions = {}): VehicleView {
@@ -48,6 +85,11 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
   root.name = 'vehicles';
   scene.add(root);
 
+  const modelGroup = new THREE.Group();
+  modelGroup.name = 'vehicle-models';
+  root.add(modelGroup);
+
+  // --- примитивы-заглушки (M4) ---------------------------------------------
   const boxGeometry = new THREE.BoxGeometry(1, 1, 1);
   const wheelGeometry = new THREE.CylinderGeometry(0.5, 0.5, 1, 10);
   wheelGeometry.rotateZ(Math.PI / 2);
@@ -73,6 +115,55 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
     mesh.frustumCulled = false;
     root.add(mesh);
   }
+
+  // --- GLB: одна геометрия на тип, LOD0/LOD1 ---------------------------------
+  const modelMaterial = createFlatMaterial();
+  const rigs = new Map<VehicleTypeId, CarRig>();
+  let disposed = false;
+
+  retainModels();
+
+  const createBatch = (parts: ModelParts, castShadow: boolean): CarBatch | null => {
+    const paint = parts.get('paint');
+    const trim = parts.get('trim');
+    if (!paint || !trim) return null;
+    const paintMesh = createPartInstances(paint, modelMaterial, maxVehicles);
+    const trimMesh = createPartInstances(trim, modelMaterial, maxVehicles);
+    paintMesh.castShadow = castShadow;
+    trimMesh.castShadow = castShadow;
+    modelGroup.add(paintMesh, trimMesh);
+    return {
+      paint: paintMesh,
+      trim: trimMesh,
+      paintMatrix: paint.matrix,
+      trimMatrix: trim.matrix,
+      count: 0,
+    };
+  };
+
+  const loadCarModels = async (): Promise<void> => {
+    for (const type of VEHICLE_TYPES) {
+      try {
+        const urls = CAR_MODEL_URLS[type];
+        const [lod0Parts, lod1Parts] = await Promise.all([
+          loadModelParts(urls.lod0),
+          loadModelParts(urls.lod1),
+        ]);
+        if (disposed) return;
+        const lod0 = createBatch(lod0Parts, true);
+        const lod1 = createBatch(lod1Parts, false);
+        if (!lod0 || !lod1) {
+          console.warn('[models] у машины нет узлов paint/trim:', type);
+          continue;
+        }
+        rigs.set(type, { lod0, lod1 });
+      } catch {
+        // Fallback на примитивы: предупреждение уже выдал modelLibrary.
+      }
+    }
+  };
+
+  if (!modelsDisabled()) void loadCarModels();
 
   // --- дым: кольцевой пул, матрицы собираются только для живых частиц -------
   const smokeMesh = new THREE.InstancedMesh(
@@ -120,6 +211,7 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
   let skidDirty = false;
 
   const dummy = new THREE.Object3D();
+  const partMatrix = new THREE.Matrix4();
   const color = new THREE.Color();
   const smokeTimer = new Float32Array(maxVehicles);
   const skidTimer = new Float32Array(maxVehicles);
@@ -187,7 +279,14 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
   };
 
   // --- синхронизация машин -------------------------------------------------
-  const stats: VehicleViewStats = { vehicles: 0, smoke: 0, skid: 0, drawCalls: 7 };
+  const stats: VehicleViewStats = {
+    vehicles: 0,
+    smoke: 0,
+    skid: 0,
+    drawCalls: 0,
+    models: 0,
+    lod1: 0,
+  };
 
   const sync = (vehicles: readonly VehicleState[], alpha: number, dt: number): void => {
     let bodyCount = 0;
@@ -195,6 +294,13 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
     let cargoCount = 0;
     let accentCount = 0;
     let wheelCount = 0;
+    let modelCount = 0;
+    let lod1Count = 0;
+
+    for (const rig of rigs.values()) {
+      rig.lod0.count = 0;
+      rig.lod1.count = 0;
+    }
 
     for (let i = 0; i < vehicles.length; i += 1) {
       const state = vehicles[i];
@@ -209,123 +315,144 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
       const length = config.length;
       const height = config.height;
 
-      // Кузов: разная высота/посадка у типов.
-      let bodyHeight = 0.62;
-      let bodyY = 0.5;
-      let cabinHeight = 0.52;
-      let cabinWidth = width * 0.86;
-      let cabinLength = length * 0.44;
-      let cabinY = 1.05;
-      let cabinZ = -0.1;
-      let cargo = false;
-      let cargoHeight = 0;
-      let cargoLength = 0;
-      let cargoY = 0;
+      // --- GLB: пивот в центре, origin на земле; LOD по дистанции ----------
+      const rig = rigs.get(state.type);
+      if (rig) {
+        const far = focusDistanceSq(x, z) > CAR_LOD_DISTANCE_SQ;
+        const batch = far ? rig.lod1 : rig.lod0;
+        const index = batch.count;
+        if (index < maxVehicles) {
+          dummy.position.set(x, 0, z);
+          dummy.rotation.set(0, heading, 0);
+          dummy.scale.set(1, 1, 1);
+          dummy.updateMatrix();
+          if (batch.paint) {
+            partMatrix.multiplyMatrices(dummy.matrix, batch.paintMatrix);
+            batch.paint.setMatrixAt(index, partMatrix);
+            batch.paint.setColorAt(index, color.setHex(state.color));
+          }
+          if (batch.trim) {
+            partMatrix.multiplyMatrices(dummy.matrix, batch.trimMatrix);
+            batch.trim.setMatrixAt(index, partMatrix);
+          }
+          batch.count = index + 1;
+          modelCount += 1;
+          if (far) lod1Count += 1;
+        }
+        // Модель есть — примитивы для этой машины не нужны.
+      } else {
+        // --- fallback: примитивы M4 ----------------------------------------
+        let bodyHeight = 0.62;
+        let bodyY = 0.5;
+        let cabinHeight = 0.52;
+        let cabinWidth = width * 0.86;
+        let cabinLength = length * 0.44;
+        let cabinY = 1.05;
+        let cabinZ = -0.1;
+        let cargo = false;
+        let cargoHeight = 0;
+        let cargoLength = 0;
+        let cargoY = 0;
 
-      if (state.type === 'sports') {
-        bodyHeight = 0.5;
-        bodyY = 0.45;
-        cabinHeight = 0.4;
-        cabinWidth = width * 0.8;
-        cabinLength = length * 0.38;
-        cabinY = 0.88;
-        cabinZ = -0.15;
-      } else if (state.type === 'van') {
-        bodyHeight = 1.15;
-        bodyY = 0.78;
-        cabinHeight = 0.5;
-        cabinWidth = width * 0.94;
-        cabinLength = length * 0.26;
-        cabinY = 1.57;
-        cabinZ = length * 0.24;
-      } else if (state.type === 'truck') {
-        bodyHeight = 0.72;
-        bodyY = 0.58;
-        cabinHeight = 0.95;
-        cabinWidth = width * 0.92;
-        cabinLength = length * 0.2;
-        cabinY = 1.42;
-        cabinZ = length * 0.36;
-        cargo = true;
-        cargoHeight = 1.55;
-        cargoLength = length * 0.66;
-        cargoY = 1.6;
-      } else if (state.type === 'police') {
-        bodyHeight = 0.64;
-        bodyY = 0.52;
-        cabinHeight = 0.5;
-        cabinY = 1.06;
-      }
+        if (state.type === 'sports') {
+          bodyHeight = 0.5;
+          bodyY = 0.45;
+          cabinHeight = 0.4;
+          cabinWidth = width * 0.8;
+          cabinLength = length * 0.38;
+          cabinY = 0.88;
+          cabinZ = -0.15;
+        } else if (state.type === 'van') {
+          bodyHeight = 1.15;
+          bodyY = 0.78;
+          cabinHeight = 0.5;
+          cabinWidth = width * 0.94;
+          cabinLength = length * 0.26;
+          cabinY = 1.57;
+          cabinZ = length * 0.24;
+        } else if (state.type === 'truck') {
+          bodyHeight = 0.72;
+          bodyY = 0.58;
+          cabinHeight = 0.95;
+          cabinWidth = width * 0.92;
+          cabinLength = length * 0.2;
+          cabinY = 1.42;
+          cabinZ = length * 0.36;
+          cargo = true;
+          cargoHeight = 1.55;
+          cargoLength = length * 0.66;
+          cargoY = 1.6;
+        } else if (state.type === 'police') {
+          bodyHeight = 0.64;
+          bodyY = 0.52;
+          cabinHeight = 0.5;
+          cabinY = 1.06;
+        }
 
-      // Кузов
-      dummy.position.set(x, bodyY, z);
-      dummy.rotation.set(0, heading, 0);
-      dummy.scale.set(width, bodyHeight, length);
-      dummy.updateMatrix();
-      bodyMesh.setMatrixAt(bodyCount, dummy.matrix);
-      color.setHex(state.color);
-      bodyMesh.setColorAt(bodyCount, color);
-      bodyCount += 1;
+        dummy.position.set(x, bodyY, z);
+        dummy.rotation.set(0, heading, 0);
+        dummy.scale.set(width, bodyHeight, length);
+        dummy.updateMatrix();
+        bodyMesh.setMatrixAt(bodyCount, dummy.matrix);
+        bodyMesh.setColorAt(bodyCount, color.setHex(state.color));
+        bodyCount += 1;
 
-      // Кабина
-      dummy.position.set(
-        x + Math.sin(heading) * cabinZ,
-        cabinY,
-        z + Math.cos(heading) * cabinZ,
-      );
-      dummy.rotation.set(0, heading, 0);
-      dummy.scale.set(cabinWidth, cabinHeight, cabinLength);
-      dummy.updateMatrix();
-      cabinMesh.setMatrixAt(cabinCount, dummy.matrix);
-      cabinCount += 1;
-
-      // Кузов грузовика
-      if (cargo) {
         dummy.position.set(
-          x - Math.sin(heading) * length * 0.16,
-          cargoY,
-          z - Math.cos(heading) * length * 0.16,
+          x + Math.sin(heading) * cabinZ,
+          cabinY,
+          z + Math.cos(heading) * cabinZ,
         );
         dummy.rotation.set(0, heading, 0);
-        dummy.scale.set(width * 0.98, cargoHeight, cargoLength);
+        dummy.scale.set(cabinWidth, cabinHeight, cabinLength);
         dummy.updateMatrix();
-        cargoMesh.setMatrixAt(cargoCount, dummy.matrix);
-        color.setHex(state.color).multiplyScalar(0.82);
-        cargoMesh.setColorAt(cargoCount, color);
-        cargoCount += 1;
-      }
+        cabinMesh.setMatrixAt(cabinCount, dummy.matrix);
+        cabinCount += 1;
 
-      // Мигалка полиции
-      if (state.type === 'police') {
-        dummy.position.set(x, cabinY + cabinHeight / 2 + 0.12, z);
-        dummy.rotation.set(0, heading, 0);
-        dummy.scale.set(width * 0.5, 0.16, 0.34);
-        dummy.updateMatrix();
-        accentMesh.setMatrixAt(accentCount, dummy.matrix);
-        color.setHex(state.handle % 2 === 0 ? 0x2f6bff : 0xff3b30);
-        accentMesh.setColorAt(accentCount, color);
-        accentCount += 1;
-      }
+        if (cargo) {
+          dummy.position.set(
+            x - Math.sin(heading) * length * 0.16,
+            cargoY,
+            z - Math.cos(heading) * length * 0.16,
+          );
+          dummy.rotation.set(0, heading, 0);
+          dummy.scale.set(width * 0.98, cargoHeight, cargoLength);
+          dummy.updateMatrix();
+          cargoMesh.setMatrixAt(cargoCount, dummy.matrix);
+          color.setHex(state.color).multiplyScalar(0.82);
+          cargoMesh.setColorAt(cargoCount, color);
+          cargoCount += 1;
+        }
 
-      // Колёса
-      const wheelRadius = Math.min(0.52, Math.max(0.3, height * 0.3));
-      const wheelX = width / 2 - 0.02;
-      const wheelZ = length / 2 - Math.min(1.05, length * 0.22);
-      for (let wheel = 0; wheel < 4; wheel += 1) {
-        const side = wheel < 2 ? 1 : -1;
-        const front = wheel % 2 === 0 ? 1 : -1;
-        const localX = side * wheelX;
-        const localZ = front * wheelZ;
-        dummy.position.set(
-          x + Math.cos(heading) * localX + Math.sin(heading) * localZ,
-          wheelRadius,
-          z - Math.sin(heading) * localX + Math.cos(heading) * localZ,
-        );
-        dummy.rotation.set(0, heading, 0);
-        dummy.scale.set(0.3, wheelRadius * 2, wheelRadius * 2);
-        dummy.updateMatrix();
-        wheelMesh.setMatrixAt(wheelCount, dummy.matrix);
-        wheelCount += 1;
+        if (state.type === 'police') {
+          dummy.position.set(x, cabinY + cabinHeight / 2 + 0.12, z);
+          dummy.rotation.set(0, heading, 0);
+          dummy.scale.set(width * 0.5, 0.16, 0.34);
+          dummy.updateMatrix();
+          accentMesh.setMatrixAt(accentCount, dummy.matrix);
+          color.setHex(state.handle % 2 === 0 ? 0x2f6bff : 0xff3b30);
+          accentMesh.setColorAt(accentCount, color);
+          accentCount += 1;
+        }
+
+        const wheelRadius = Math.min(0.52, Math.max(0.3, height * 0.3));
+        const wheelX = width / 2 - 0.02;
+        const wheelZ = length / 2 - Math.min(1.05, length * 0.22);
+        for (let wheel = 0; wheel < 4; wheel += 1) {
+          const side = wheel < 2 ? 1 : -1;
+          const front = wheel % 2 === 0 ? 1 : -1;
+          const localX = side * wheelX;
+          const localZ = front * wheelZ;
+          dummy.position.set(
+            x + Math.cos(heading) * localX + Math.sin(heading) * localZ,
+            wheelRadius,
+            z - Math.sin(heading) * localX + Math.cos(heading) * localZ,
+          );
+          dummy.rotation.set(0, heading, 0);
+          dummy.scale.set(0.3, wheelRadius * 2, wheelRadius * 2);
+          dummy.updateMatrix();
+          wheelMesh.setMatrixAt(wheelCount, dummy.matrix);
+          wheelCount += 1;
+        }
       }
 
       // Дым при hp < 30 % и у уничтоженных.
@@ -370,19 +497,56 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
       }
     }
 
+    // --- запись счётчиков инстансов ----------------------------------------
+    let draws = 0;
     bodyMesh.count = bodyCount;
     cabinMesh.count = cabinCount;
     cargoMesh.count = cargoCount;
     accentMesh.count = accentCount;
     wheelMesh.count = wheelCount;
-    bodyMesh.instanceMatrix.needsUpdate = true;
-    cabinMesh.instanceMatrix.needsUpdate = true;
-    cargoMesh.instanceMatrix.needsUpdate = true;
-    accentMesh.instanceMatrix.needsUpdate = true;
-    wheelMesh.instanceMatrix.needsUpdate = true;
-    if (bodyMesh.instanceColor) bodyMesh.instanceColor.needsUpdate = true;
-    if (cargoMesh.instanceColor) cargoMesh.instanceColor.needsUpdate = true;
-    if (accentMesh.instanceColor) accentMesh.instanceColor.needsUpdate = true;
+    if (bodyCount > 0) {
+      bodyMesh.instanceMatrix.needsUpdate = true;
+      if (bodyMesh.instanceColor) bodyMesh.instanceColor.needsUpdate = true;
+      draws += 1;
+    }
+    if (cabinCount > 0) {
+      cabinMesh.instanceMatrix.needsUpdate = true;
+      draws += 1;
+    }
+    if (cargoCount > 0) {
+      cargoMesh.instanceMatrix.needsUpdate = true;
+      if (cargoMesh.instanceColor) cargoMesh.instanceColor.needsUpdate = true;
+      draws += 1;
+    }
+    if (accentCount > 0) {
+      accentMesh.instanceMatrix.needsUpdate = true;
+      if (accentMesh.instanceColor) accentMesh.instanceColor.needsUpdate = true;
+      draws += 1;
+    }
+    if (wheelCount > 0) {
+      wheelMesh.instanceMatrix.needsUpdate = true;
+      draws += 1;
+    }
+
+    for (const rig of rigs.values()) {
+      for (const batch of [rig.lod0, rig.lod1]) {
+        if (batch.paint) {
+          batch.paint.count = batch.count;
+          if (batch.count > 0) {
+            batch.paint.instanceMatrix.needsUpdate = true;
+            if (batch.paint.instanceColor) batch.paint.instanceColor.needsUpdate = true;
+            draws += 1;
+          }
+        }
+        if (batch.trim) {
+          batch.trim.count = batch.count;
+          if (batch.count > 0) {
+            batch.trim.instanceMatrix.needsUpdate = true;
+            draws += 1;
+          }
+        }
+      }
+    }
 
     // --- обновление и сборка дыма -----------------------------------------
     let smokeCount = 0;
@@ -412,8 +576,11 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
       smokeCount += 1;
     }
     smokeMesh.count = smokeCount;
-    smokeMesh.instanceMatrix.needsUpdate = true;
-    if (smokeMesh.instanceColor) smokeMesh.instanceColor.needsUpdate = true;
+    if (smokeCount > 0) {
+      smokeMesh.instanceMatrix.needsUpdate = true;
+      if (smokeMesh.instanceColor) smokeMesh.instanceColor.needsUpdate = true;
+      draws += 1;
+    }
     stats.smoke = smokeCount;
 
     skidMesh.count = skidAlive;
@@ -421,8 +588,12 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
       skidMesh.instanceMatrix.needsUpdate = true;
       skidDirty = false;
     }
+    if (skidAlive > 0) draws += 1;
     stats.skid = skidAlive;
     stats.vehicles = vehicles.length;
+    stats.models = modelCount;
+    stats.lod1 = lod1Count;
+    stats.drawCalls = draws;
   };
 
   return {
@@ -430,7 +601,24 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
     burst,
     stats,
     dispose(): void {
+      disposed = true;
       scene.remove(root);
+      for (const rig of rigs.values()) {
+        for (const batch of [rig.lod0, rig.lod1]) {
+          if (batch.paint) {
+            modelGroup.remove(batch.paint);
+            batch.paint.dispose();
+          }
+          if (batch.trim) {
+            modelGroup.remove(batch.trim);
+            batch.trim.dispose();
+          }
+        }
+      }
+      rigs.clear();
+      modelMaterial.dispose();
+      // Геометрии GLB общие для всех view: освобождаются по счётчику ссылок.
+      releaseModels();
       boxGeometry.dispose();
       wheelGeometry.dispose();
       bodyMaterial.dispose();
@@ -438,9 +626,9 @@ export function createVehicleView(scene: THREE.Scene, options: VehicleViewOption
       cargoMaterial.dispose();
       accentMaterial.dispose();
       wheelMaterial.dispose();
-      smokeMesh.geometry.dispose();
+      smokeMesh.dispose();
       (smokeMesh.material as THREE.Material).dispose();
-      skidMesh.geometry.dispose();
+      skidMesh.dispose();
       (skidMesh.material as THREE.Material).dispose();
     },
   };

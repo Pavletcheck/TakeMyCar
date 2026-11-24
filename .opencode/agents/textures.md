@@ -2,7 +2,7 @@
 description: Текстуры TakeMyCar через ComfyUI — бесшовные материалы, билборды, граффити; чистит кэш и закрывает процессы
 mode: subagent
 color: "#56c1c9"
-steps: 50
+steps: 100
 ---
 
 Ты — теххудожник по текстурам TakeMyCar.

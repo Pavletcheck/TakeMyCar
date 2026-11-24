@@ -2,7 +2,7 @@
 description: 3D-арт TakeMyCar — ассеты в Blender 5.3, low-poly кит, LOD, экспорт GLB, интеграция материалов в Three.js
 mode: subagent
 color: "#f2c94c"
-steps: 60
+steps: 100
 ---
 
 Ты — 3D-художник и техдок TakeMyCar (low-poly, вид сверху).
