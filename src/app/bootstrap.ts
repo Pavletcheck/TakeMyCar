@@ -1,7 +1,7 @@
 import * as THREE from 'three';
+import { createGameAudio } from '../audio/audio';
 import { FollowCamera } from '../core/camera';
 import { resolveRectBody } from '../core/collision';
-import { EventBus } from '../core/events';
 import { attachKeyboard, createInputState, InputMap } from '../core/input';
 import { GameLoop } from '../core/loop';
 import { clamp, circleRect, lerp, lerpAngle } from '../core/math';
@@ -21,6 +21,12 @@ import { VEHICLE_TYPES, isVehicleType, vehicleColliderRadius } from '../config/v
 import { PLAYER } from '../config/player';
 import { WANTED, WEAPON_ORDER } from '../config/life';
 import type { VehicleTypeId } from '../config/vehicles';
+import { ECONOMY } from '../config/economy';
+import type { UpgradeId } from '../config/economy';
+import { MISSIONS, findMission } from '../config/missions';
+import type { MissionDef } from '../config/missions';
+import { UI } from '../config/ui';
+import type { LangCode, TouchMode, UiQuality } from '../config/ui';
 import {
   VehicleFleet,
   createVehicle,
@@ -32,18 +38,33 @@ import {
 import type { VehicleState } from '../entities/vehicle';
 import { NpcPool } from '../entities/npc';
 import { IDLE_VEHICLE_INPUT, VehiclePhysics } from '../systems/vehiclePhysics';
-import { createVehicleAudio } from '../systems/vehicleAudio';
 import { PlayerController } from '../systems/playerController';
 import { TrafficSystem } from '../systems/traffic';
 import { PedsSystem } from '../systems/peds';
 import { CombatSystem } from '../systems/combat';
 import { WantedSystem } from '../systems/wanted';
+import { EconomySystem } from '../systems/economy';
+import { MissionSystem } from '../systems/missions';
+import type { MissionHudState } from '../systems/missions';
+import { createSaveService, SAVE_VERSION } from './save';
+import type { SaveProfile, SaveSettings } from './save';
+import { createHud } from '../ui/hud';
+import type { HudMission } from '../ui/hud';
+import { createI18n, detectLang } from '../ui/i18n';
+import { createMenu } from '../ui/menu';
+import type { MenuState, SoundKind } from '../ui/menu';
+import { createMinimap } from '../ui/minimap';
+import type { MinimapMarker } from '../ui/minimap';
+import { createMobileControls } from '../ui/mobile';
+import { createPager } from '../ui/pager';
+import type { PagerEntry } from '../ui/pager';
+import { applyTheme } from '../ui/theme';
+import { createToast } from '../ui/toast';
 import { DEFAULT_MAP_ID, loadCityMap } from '../world/mapLoader';
 import { serializeRoadGraph } from '../world/roadGraph';
 import type { SpawnPoint } from '../world/types';
 import { buildWorldFromMap } from '../world/world';
 import { createDebugStats, DebugOverlay } from './debug';
-import { createLifeHud } from './lifeHud';
 
 // ---------------------------------------------------------------------------
 // M4. Композиционный корень: мир, флот машин, игрок (за рулём и пешком),
@@ -102,10 +123,6 @@ const MOVER_CENTER = 38;
 const MOVER_AMPLITUDE = 24;
 const MOVER_COLOR = 0xffa94d;
 
-interface GameEvents extends Record<string, unknown> {
-  pause: { paused: boolean };
-}
-
 /** Движущийся коллайдер стресс-режима: кинематика по синусу. */
 interface MoverSpec {
   id: EntityId;
@@ -119,6 +136,76 @@ interface MoverSpec {
   /** Якорь спавна: тела создавались относительно машины, а не мирового нуля. */
   anchorX: number;
   anchorZ: number;
+}
+
+/** 3D-маркер миссии: кольцо зоны + луч, чтобы цель была видна в городе. */
+interface MissionMarkerView {
+  set(x: number, z: number, radius: number, color: number): void;
+  hide(): void;
+  update(dt: number): void;
+  dispose(): void;
+}
+
+function createMissionMarkerView(scene: THREE.Scene): MissionMarkerView {
+  const group = new THREE.Group();
+  group.visible = false;
+
+  const ringMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffa94d,
+    transparent: true,
+    opacity: 0.8,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.94, 1, 48), ringMaterial);
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.14;
+  ring.renderOrder = 2;
+
+  const beamMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffa94d,
+    transparent: true,
+    opacity: 0.14,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const beam = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 7, 20, 1, true), beamMaterial);
+  beam.position.y = 3.5;
+  beam.renderOrder = 2;
+
+  group.add(ring, beam);
+  scene.add(group);
+
+  let time = 0;
+
+  return {
+    set(x: number, z: number, radius: number, color: number): void {
+      group.position.set(x, 0, z);
+      ring.scale.set(radius, radius, radius);
+      const beamScale = Math.max(0.7, radius * 0.06);
+      beam.scale.set(beamScale, 1, beamScale);
+      ringMaterial.color.setHex(color);
+      beamMaterial.color.setHex(color);
+      group.visible = true;
+    },
+    hide(): void {
+      group.visible = false;
+    },
+    update(dt: number): void {
+      if (!group.visible) return;
+      time += dt;
+      ringMaterial.opacity = 0.55 + Math.sin(time * 3.2) * 0.25;
+      beamMaterial.opacity = 0.1 + Math.sin(time * 2.1) * 0.05;
+      group.position.y = Math.sin(time * 2) * 0.05;
+    },
+    dispose(): void {
+      scene.remove(group);
+      ring.geometry.dispose();
+      ringMaterial.dispose();
+      beam.geometry.dispose();
+      beamMaterial.dispose();
+    },
+  };
 }
 
 /** Отладочный API под ?debug=1: карта, бюджеты, машины и физика. */
@@ -157,6 +244,33 @@ interface TmcDebugApi {
   spawnCop(x?: number, z?: number): number;
   /** M5: оружие, патроны, перезарядка, отдача. */
   combatState(): Record<string, number | string>;
+  /** M6: активный заказ, прогресс, маркер, кулдауны. */
+  missions(): Record<string, number | string>;
+  /** M6: все заказы со статусами для смоука/пейджера. */
+  missionList(): Record<string, number | string>[];
+  /** M6: взять заказ по id; 1 — взяли. */
+  startMission(id: string): number;
+  /** M6: деньги, апгрейды, накопленный доход. */
+  money(): number;
+  /** M6: начислить деньги (отладка/смоук). */
+  addMoney(amount: number): number;
+  /** M6: язык ru/en/tr без перезагрузки. */
+  setLang(lang: string): string;
+  /** M6: сохранить профиль; 1 — успешно. */
+  saveGame(): number;
+  /** M6: загрузить профиль; 1 — успешно. */
+  loadGame(): number;
+  /** M6: купить апгрейд (без проверки гаража). */
+  buyUpgrade(id: string): number;
+  /** M6: ремонт и покраска активной машины (без проверки гаража). */
+  repairVehicle(): number;
+  paintVehicle(): number;
+  /** M6: купить патроны (без проверки гаража). */
+  buyAmmo(): number;
+  /** M6: цены и доступность услуг гаража. */
+  shop(): Record<string, number | string>;
+  /** M6: снимок интерфейса: HUD, меню, пейджер, мобилка, мини-карта. */
+  uiState(): Record<string, number | string>;
 }
 
 declare global {
@@ -171,24 +285,82 @@ export function bootstrap(): void {
 
   const params = new URLSearchParams(window.location.search);
   const debugWorld = params.get('debug') === '1';
+  const showStats = debugWorld || params.get('stats') === '1';
   const stressEnabled = params.get('stress') === '1';
   // Планировка авторская и фиксированная: ?seed больше не меняет карту.
   // ?map=city выбирает файл карты из assets/maps.
   const map = loadCityMap(params.get('map') ?? DEFAULT_MAP_ID);
   const seed = map.seed;
 
-  const events = new EventBus<GameEvents>();
+  // --- M6: сохранение, язык, тема, слой интерфейса --------------------------
+  const saveService = createSaveService();
+  const savedProfile = saveService.load();
+  const uiSettings: SaveSettings = {
+    ...UI.settings,
+    ...(savedProfile ? savedProfile.settings : {}),
+  };
+  const i18n = createI18n(savedProfile ? uiSettings.lang : detectLang(navigator.language));
+  uiSettings.lang = i18n.lang;
+  applyTheme(UI);
+
   const input = new InputMap();
   attachKeyboard(input, window);
   const inputState = createInputState();
-  const debug = new DebugOverlay(document.getElementById('stats'));
-  const hintElement = document.getElementById('hint');
-  const lifeHud = createLifeHud(document.getElementById('hud'));
+  const statsElement = document.getElementById('stats');
+  if (statsElement && !showStats) statsElement.hidden = true;
+  const debug = new DebugOverlay(statsElement);
+  const uiRoot = document.getElementById('hud') ?? document.body;
+  const hud = createHud(uiRoot, i18n);
+  const toast = createToast(uiRoot);
+  const pager = createPager(uiRoot, i18n, UI, {
+    onClose: () => closePagerPanel(),
+  });
   const frameStats = createDebugStats();
   frameStats.seed = seed;
   frameStats.mapId = map.id;
   frameStats.showWorld = debugWorld;
   frameStats.stressActive = stressEnabled;
+
+  const statsState = {
+    missionsCompleted: savedProfile ? savedProfile.stats.missionsCompleted : 0,
+    missionsFailed: savedProfile ? savedProfile.stats.missionsFailed : 0,
+    playSeconds: savedProfile ? savedProfile.stats.playSeconds : 0,
+  };
+
+  const menu = createMenu(uiRoot, i18n, UI, {
+    getState: () => buildMenuState(),
+    onStart: () => startPlaying(),
+    onResume: () => closePauseMenu(),
+    onSave: () => {
+      saveGame(false);
+    },
+    onLoad: () => {
+      loadGame();
+    },
+    onReset: () => {
+      resetProgress();
+    },
+    onLang: (lang) => setLanguage(lang),
+    onVolume: (volume) => setVolume(volume),
+    onMute: (muted) => setMuted(muted),
+    onQuality: (quality) => setQuality(quality),
+    onTouch: (mode) => setTouchMode(mode),
+    onHints: (enabled) => setHints(enabled),
+    onRepair: () => shopRepair(),
+    onPaint: () => shopPaint(),
+    onAmmo: () => shopAmmo(),
+    onUpgrade: (id) => shopUpgrade(id),
+    onClose: () => closePauseMenu(),
+    onSound: (kind) => playSound(kind),
+  });
+
+  const mobile = createMobileControls(uiRoot, i18n, UI, {
+    onPause: () => togglePauseMenu(),
+    onMission: () => togglePager(),
+    onSound: () => audio.ui('click'),
+  });
+  mobile.setMode(uiSettings.touch);
+  hud.setVisible(true);
 
   // --- рендерер и сцена -----------------------------------------------------
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
@@ -222,6 +394,8 @@ export function bootstrap(): void {
   // --- мир ------------------------------------------------------------------
   // Мир собирается из авторской карты (assets/maps/city.json), а не из сида.
   const world = buildWorldFromMap(map, WORLD);
+  // Мини-карта получает снимок геометрии мира: ui не импортирует world/**.
+  const minimap = createMinimap(hud.minimapHost, world.minimap, UI, i18n);
   const colliderHash = world.colliders;
   const registry = new EntityRegistry(colliderHash);
   const collisionCandidates: Collider[] = [];
@@ -540,7 +714,9 @@ export function bootstrap(): void {
   applyCamera();
 
   // --- физика машин и игрок -------------------------------------------------
-  const audio = createVehicleAudio();
+  const audio = createGameAudio();
+  audio.setVolume(uiSettings.volume);
+  audio.setMuted(uiSettings.muted);
   const physics = new VehiclePhysics(registry, fleet, colliderHash, TUNING, world.bounds, audio);
   const playerController = new PlayerController(
     fleet,
@@ -606,7 +782,12 @@ export function bootstrap(): void {
   combat.onImpact = (x, z, hit) => effectsView.impact(x, z, hit);
   traffic.onHonk = (x, z) => peds.alertAt(x, z, 16, 'alert');
   wanted.onLevelChanged = (level) => {
-    lifeHud.notify(level > 0 ? `Розыск ${level}` : 'Розыск снят');
+    if (level > 0) {
+      toast.show(i18n.t('toast.starsUp', { level }), 'error', 2.4);
+      playSound('error');
+    } else {
+      toast.show(i18n.t('toast.starsClear'), 'success', 2.4);
+    }
   };
   wanted.onPlayerCaught = (reason) => {
     // Арест или «выведен из строя»: игрок в безопасную точку, розыск сброшен.
@@ -623,8 +804,103 @@ export function bootstrap(): void {
     world.prefetch(point.x, point.z);
     shakeTime = 0;
     wanted.reset();
-    lifeHud.notify(reason === 'arrest' ? 'Арест! Розыск снят' : 'Выведен из строя');
+    toast.show(
+      i18n.t(reason === 'arrest' ? 'toast.arrest' : 'toast.down'),
+      'error',
+      3,
+    );
+    playSound('error');
   };
+
+  // --- M6: экономика и миссии ----------------------------------------------
+  const economy = new EconomySystem({
+    config: ECONOMY,
+    onChanged: (change) => {
+      if (change.delta > 0) playSound('success');
+    },
+    onPaintReset: () => {
+      wanted.reset();
+    },
+    onRefill: () => {
+      // Деньги уже списаны в economy.buyAmmo (BUG-M6-007).
+      combat.refill();
+    },
+    onAmmoNeeded: () => {
+      const spec = combat.weaponSpec;
+      return combat.magAmmo < spec.mag || combat.reserveAmmo < spec.reserve;
+    },
+  });
+  let missionCar: VehicleState | null = null;
+
+  const missions = new MissionSystem({
+    missions: MISSIONS,
+    completed: savedProfile ? savedProfile.missions.completed : undefined,
+    cooldowns: savedProfile ? savedProfile.missions.cooldowns : undefined,
+    onStart: (def) => {
+      audio.mission('start');
+      return spawnMissionCar(def)?.id ?? null;
+    },
+    onStage: () => {
+      audio.mission('pickup');
+      toast.show(i18n.t('mission.stageChanged'), 'info', 1.6);
+    },
+    onComplete: (def, baseReward) => {
+      const reward = Math.round(baseReward * economy.rewardMultiplier);
+      economy.add(reward, 'mission');
+      statsState.missionsCompleted += 1;
+      toast.show(
+        i18n.t('mission.completed', {
+          title: i18n.t(def.titleKey),
+          reward: `${i18n.t('hud.currency')}${i18n.formatNumber(reward)}`,
+        }),
+        'success',
+        4,
+      );
+      audio.mission('complete');
+      releaseMissionCar();
+      saveGame(true);
+    },
+    onFail: (def, reason) => {
+      const heat = Math.max(0, def.heatOnFail - economy.heatRelief);
+      if (heat > 0) wanted.setLevel(Math.max(wanted.level, heat));
+      statsState.missionsFailed += 1;
+      toast.show(i18n.t(`mission.failed.${reason}`), 'error', 4);
+      audio.mission('fail');
+      releaseMissionCar();
+    },
+    onOffer: () => {
+      toast.show(i18n.t('mission.newOffer'), 'info');
+      playSound('success');
+    },
+  });
+
+  /** Машина под заказ «угон»: ставится на проезжую часть у точки старта. */
+  function spawnMissionCar(def: MissionDef): VehicleState | null {
+    if (!def.vehicleClass) return null;
+    let x = def.start[0];
+    let z = def.start[1];
+    let heading = 0;
+    if (!placementFree(x, z, 3)) {
+      const point = pickRespawn(x, z, 3);
+      x = point.x;
+      z = point.z;
+      heading = point.heading;
+    }
+    missionCar = createVehicle(fleet, registry, {
+      type: def.vehicleClass,
+      x,
+      z,
+      heading,
+      colorIndex: 1,
+    });
+    return missionCar;
+  }
+
+  /** Машина заказа не должна копиться в мире: убираем, если игрок не за рулём. */
+  function releaseMissionCar(): void {
+    if (missionCar && missionCar.driver < 0) destroyVehicle(fleet, registry, missionCar);
+    missionCar = null;
+  }
 
   // Стартовое население: только за пределами безопасной зоны.
   traffic.prefill(TRAFFIC_PREFILL, spawn.x, spawn.z);
@@ -642,9 +918,19 @@ export function bootstrap(): void {
   };
   /** Контекст трафика: уровень розыска и ближайшая сирена. */
   const trafficContext = { wantedLevel: 0, sirenX: 0, sirenZ: 0 };
+  /** Переиспользуемый снимок для системы миссий (без аллокаций в шаге). */
+  const missionPlayer = {
+    x: spawn.x,
+    z: spawn.z,
+    inVehicle: false,
+    vehicleType: null as VehicleTypeId | null,
+    vehicleWrecked: false,
+    vehicleId: -1,
+  };
   let gameTime = 0;
   let fireHeld = false;
   let firePressed = false;
+  let stealTimer = 0;
   let reloadRequested = false;
   let hornRequested = false;
   let weaponRequest = -1;
@@ -678,7 +964,8 @@ export function bootstrap(): void {
     if (length < 0.4) return;
     dirX /= length;
     dirZ /= length;
-    combat.tryFire(originX, originZ, dirX, dirZ, vehicle ? vehicle.id : -1);
+    const fired = combat.tryFire(originX, originZ, dirX, dirZ, vehicle ? vehicle.id : -1);
+    if (fired) audio.shot(combat.weapon);
   }
 
   // --- ввод M5: огонь ЛКМ, оружие 1/2/3, перезарядка F, сигнал H ------------
@@ -689,6 +976,8 @@ export function bootstrap(): void {
 
   const onMouseDown = (event: MouseEvent): void => {
     if (event.button !== 0) return;
+    // Клик по HUD/меню не должен стрелять: огонь только по игровому полотну.
+    if (!(event.target instanceof HTMLCanvasElement)) return;
     updatePointer(event);
     fireHeld = true;
     firePressed = true;
@@ -794,9 +1083,35 @@ export function bootstrap(): void {
 
   // E/H/F/1..3 не входят в общий InputMap ядра: добавляем одноразовые
   // действия здесь, чтобы не менять контракт core/input в M4/M5.
+  // M6: Esc — пауза, M — пейджер, цифры в пейджере — выбор заказа.
   let interactRequested = false;
   const onKeyDown = (event: KeyboardEvent): void => {
     if (event.repeat) return;
+    if (missions.pagerOpen) {
+      if (event.code === 'Escape' || event.code === 'KeyM') {
+        event.preventDefault();
+        closePagerPanel();
+        return;
+      }
+      if (event.code.startsWith('Digit')) {
+        const index = Number(event.code.slice(5));
+        if (index >= 1 && index <= 9) {
+          event.preventDefault();
+          startMissionByIndex(index);
+        }
+        return;
+      }
+    }
+    if (event.code === 'Escape') {
+      event.preventDefault();
+      togglePauseMenu();
+      return;
+    }
+    if (event.code === 'KeyM') {
+      event.preventDefault();
+      togglePager();
+      return;
+    }
     if (event.code === 'KeyE') {
       interactRequested = true;
     } else if (event.code === 'KeyH') {
@@ -812,6 +1127,15 @@ export function bootstrap(): void {
     }
   };
   window.addEventListener('keydown', onKeyDown);
+
+  // Первый жест разблокирует WebAudio (политика автозапуска браузеров).
+  const unlockAudio = (): void => {
+    audio.resume();
+    window.removeEventListener('pointerdown', unlockAudio);
+    window.removeEventListener('keydown', unlockAudio);
+  };
+  window.addEventListener('pointerdown', unlockAudio);
+  window.addEventListener('keydown', unlockAudio);
 
   // --- стресс-режим: движение кинематических тел ----------------------------
   function updateStressMovers(dt: number): void {
@@ -882,6 +1206,475 @@ export function bootstrap(): void {
   // --- префетч окружения до первого кадра ----------------------------------
   const prefetchMs = world.prefetch(spawn.x, spawn.z);
   cityView.sync(world);
+
+  // --- M6: пауза, интерфейс, магазин, сохранение ---------------------------
+  const missionMarkerView = createMissionMarkerView(scene);
+  let pauseBlur = false;
+  let pauseMenu = false;
+  let pausePager = false;
+  let pauseStart = true;
+  let autosaveTimer = 0;
+
+  /** Позиция активной цели: машина под управлением или пешеход. */
+  function playerWorldPosition(): { x: number; z: number } {
+    const vehicle = playerController.mode === 'driving' ? playerController.vehicle : null;
+    if (vehicle) return { x: vehicle.transform.x, z: vehicle.transform.z };
+    return { x: playerTransform.x, z: playerTransform.z };
+  }
+
+  function garageDistance(): number {
+    const position = playerWorldPosition();
+    return Math.hypot(position.x - ECONOMY.garage[0], position.z - ECONOMY.garage[1]);
+  }
+
+  function atGarage(): boolean {
+    return garageDistance() <= ECONOMY.garageRadius;
+  }
+
+  function activeVehicleOrNull(): VehicleState | null {
+    return playerController.mode === 'driving' ? playerController.vehicle : null;
+  }
+
+  function playSound(kind: SoundKind): void {
+    audio.ui(kind);
+  }
+
+  /**
+   * Пауза — набор причин: blur, меню, пейджер и стартовый экран.
+   * Снимается только снятием последней причины (как в контракте GameLoop).
+   */
+  function applyPauseState(): void {
+    const paused = pauseBlur || pauseMenu || pausePager || pauseStart;
+    if (paused) {
+      loop.pause();
+      input.clear();
+      mobile.releaseAll();
+    } else {
+      loop.resume();
+    }
+  }
+
+  function startPlaying(): void {
+    pauseStart = false;
+    menu.close();
+    audio.resume();
+    applyPauseState();
+  }
+
+  function openPauseMenu(): void {
+    if (pauseStart) return;
+    if (missions.pagerOpen) closePagerPanel();
+    pauseMenu = true;
+    menu.openPause();
+    applyPauseState();
+  }
+
+  function closePauseMenu(): void {
+    if (!pauseMenu) return;
+    pauseMenu = false;
+    menu.close();
+    applyPauseState();
+  }
+
+  function togglePauseMenu(): void {
+    if (pauseStart) return;
+    if (pauseMenu) closePauseMenu();
+    else openPauseMenu();
+  }
+
+  function refreshPager(): void {
+    if (!missions.pagerOpen) {
+      pager.close();
+      return;
+    }
+    const entries = buildPagerEntries();
+    if (pager.isOpen) pager.refresh(entries);
+    else pager.open(entries, (id) => startMissionById(id));
+  }
+
+  function openPagerPanel(): void {
+    if (pauseStart || pauseMenu) return;
+    missions.openPager();
+    pausePager = true;
+    refreshPager();
+    applyPauseState();
+    playSound('click');
+  }
+
+  function closePagerPanel(): void {
+    if (!pausePager) return;
+    missions.closePager();
+    pager.close();
+    pausePager = false;
+    applyPauseState();
+  }
+
+  function togglePager(): void {
+    if (pauseStart || pauseMenu) return;
+    if (missions.pagerOpen) closePagerPanel();
+    else openPagerPanel();
+  }
+
+  function startMissionById(id: string): void {
+    if (missions.pagerOpen) closePagerPanel();
+    if (!missions.start(id)) {
+      playSound('error');
+      toast.show(i18n.t('mission.pager.empty'), 'error', 2.2);
+      return;
+    }
+    const def = findMission(id);
+    playSound('success');
+    if (def) toast.show(i18n.t(def.titleKey), 'info', 1.8);
+  }
+
+  function startMissionByIndex(index: number): void {
+    const statuses = missions.statuses();
+    const entry = statuses[index - 1];
+    if (entry && entry.status === 'available') startMissionById(entry.def.id);
+  }
+
+  function buildPagerEntries(): PagerEntry[] {
+    const statuses = missions.statuses();
+    const entries: PagerEntry[] = [];
+    for (let i = 0; i < statuses.length; i += 1) {
+      const entry = statuses[i];
+      const def = entry.def;
+      let statusNote: string | null = null;
+      if (entry.status === 'locked' && entry.lockedBy) {
+        const lockDef = findMission(entry.lockedBy);
+        statusNote = i18n.t('mission.pager.locked', {
+          mission: lockDef ? i18n.t(lockDef.titleKey) : entry.lockedBy,
+        });
+      } else if (entry.status === 'cooldown') {
+        statusNote = i18n.t('mission.pager.cooldown', { time: i18n.formatTime(entry.cooldown) });
+      }
+      entries.push({
+        id: def.id,
+        index: i + 1,
+        title: i18n.t(def.titleKey),
+        desc: i18n.t(def.descKey),
+        typeLabel: i18n.t(`mission.pager.type.${def.type}`),
+        reward: `${i18n.t('hud.currency')}${i18n.formatNumber(def.reward)}`,
+        time:
+          def.timeLimit !== undefined
+            ? i18n.t('mission.pager.time', { time: i18n.formatTime(def.timeLimit) })
+            : null,
+        status: entry.status,
+        statusNote,
+      });
+    }
+    return entries;
+  }
+
+  function setLanguage(lang: LangCode): void {
+    uiSettings.lang = lang;
+    i18n.setLang(lang);
+  }
+
+  function setVolume(volume: number): void {
+    uiSettings.volume = clamp(volume, 0, 1);
+    audio.setVolume(uiSettings.volume);
+  }
+
+  function setMuted(muted: boolean): void {
+    uiSettings.muted = muted;
+    audio.setMuted(muted);
+  }
+
+  function setQuality(quality: UiQuality): void {
+    uiSettings.quality = quality;
+    applyQuality();
+  }
+
+  function setTouchMode(mode: TouchMode): void {
+    uiSettings.touch = mode;
+    mobile.setMode(mode);
+  }
+
+  function setHints(enabled: boolean): void {
+    uiSettings.hints = enabled;
+  }
+
+  function applyQuality(): void {
+    const preset = UI.quality[uiSettings.quality];
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, preset.pixelRatio));
+    renderer.shadowMap.enabled = preset.shadows;
+    sun.castShadow = preset.shadows;
+    resize();
+  }
+
+  // --- магазин --------------------------------------------------------------
+
+  function shopRepair(): void {
+    if (!atGarage()) {
+      menu.setMessage(
+        i18n.t('shop.needGarage', { distance: Math.round(garageDistance()) }),
+        'error',
+      );
+      playSound('error');
+      return;
+    }
+    const vehicle = activeVehicleOrNull();
+    const result = economy.repair(vehicle);
+    if (result.ok) {
+      menu.setMessage(i18n.t('shop.repaired'), 'success');
+      playSound('success');
+      return;
+    }
+    const text =
+      result.reason === 'money'
+        ? i18n.t('shop.notEnough')
+        : result.reason === 'none'
+          ? i18n.t('shop.noVehicle')
+          : i18n.t('shop.fullHp');
+    menu.setMessage(text, 'error');
+    playSound('error');
+  }
+
+  function shopPaint(): void {
+    if (!atGarage()) {
+      menu.setMessage(
+        i18n.t('shop.needGarage', { distance: Math.round(garageDistance()) }),
+        'error',
+      );
+      playSound('error');
+      return;
+    }
+    const result = economy.paint();
+    if (result.ok) {
+      menu.setMessage(i18n.t('shop.painted'), 'success');
+      playSound('success');
+      return;
+    }
+    menu.setMessage(result.reason === 'money' ? i18n.t('shop.notEnough') : i18n.t('shop.noVehicle'), 'error');
+    playSound('error');
+  }
+
+  function shopAmmo(): void {
+    if (!atGarage()) {
+      menu.setMessage(
+        i18n.t('shop.needGarage', { distance: Math.round(garageDistance()) }),
+        'error',
+      );
+      playSound('error');
+      return;
+    }
+    const result = economy.buyAmmo();
+    if (result.ok) {
+      menu.setMessage(i18n.t('shop.bought', { name: i18n.t('shop.ammo') }), 'success');
+      playSound('success');
+      return;
+    }
+    menu.setMessage(
+      result.reason === 'money'
+        ? i18n.t('shop.notEnough')
+        : result.reason === 'free'
+          ? i18n.t('shop.ammoFull')
+          : i18n.t('shop.ammoFull'),
+      'error',
+    );
+    playSound('error');
+  }
+
+  function shopUpgrade(id: string): void {
+    if (!atGarage()) {
+      menu.setMessage(
+        i18n.t('shop.needGarage', { distance: Math.round(garageDistance()) }),
+        'error',
+      );
+      playSound('error');
+      return;
+    }
+    if (!isUpgradeId(id)) return;
+    const result = economy.buyUpgrade(id);
+    if (result.ok) {
+      menu.setMessage(
+        i18n.t('shop.bought', { name: i18n.t(economy.upgradeDef(id).labelKey) }),
+        'success',
+      );
+      playSound('success');
+      return;
+    }
+    menu.setMessage(result.reason === 'money' ? i18n.t('shop.notEnough') : i18n.t('shop.max'), 'error');
+    playSound('error');
+  }
+
+  function isUpgradeId(value: string): value is UpgradeId {
+    return value === 'contacts' || value === 'garage' || value === 'insurance';
+  }
+
+  function buildMenuState(): MenuState {
+    const vehicle = activeVehicleOrNull();
+    const atG = atGarage();
+    const distance = Math.round(garageDistance());
+    const money = economy.money;
+
+    const repairCost = economy.repairCost(vehicle);
+    const canRepair = atG && repairCost > 0 && money >= repairCost;
+    const repairNote =
+      vehicle === null
+        ? i18n.t('shop.noVehicle')
+        : repairCost <= 0
+          ? i18n.t('shop.fullHp')
+          : atG
+            ? ''
+            : i18n.t('shop.needGarage', { distance });
+
+    const paintCost = economy.paintCost;
+    const canPaint = atG && money >= paintCost;
+
+    const ammoNeeded = (() => {
+      const spec = combat.weaponSpec;
+      return combat.magAmmo < spec.mag || combat.reserveAmmo < spec.reserve;
+    })();
+    const canAmmo = atG && ammoNeeded && money >= economy.ammoCost;
+    const ammoNote = ammoNeeded ? '' : i18n.t('shop.ammoFull');
+
+    const upgrades = ECONOMY.upgrades.map((def) => {
+      const level = economy.level(def.id);
+      const cost = economy.upgradeCost(def.id);
+      return {
+        id: def.id,
+        name: i18n.t(def.labelKey),
+        desc: i18n.t(def.descKey),
+        level,
+        maxLevel: def.maxLevel,
+        cost,
+        canBuy: atG && cost !== null && money >= cost,
+      };
+    });
+
+    return {
+      hasSave: saveService.hasSave,
+      settings: {
+        lang: i18n.lang,
+        volume: uiSettings.volume,
+        muted: uiSettings.muted,
+        quality: uiSettings.quality,
+        touch: uiSettings.touch,
+        hints: uiSettings.hints,
+      },
+      stats: {
+        missions: statsState.missionsCompleted,
+        failed: statsState.missionsFailed,
+        earned: `${i18n.t('hud.currency')}${i18n.formatNumber(economy.earned)}`,
+        playTime: i18n.formatTime(statsState.playSeconds),
+      },
+      shop: {
+        moneyText: i18n.formatNumber(money),
+        hasVehicle: vehicle !== null,
+        repairCost,
+        canRepair,
+        repairNote,
+        paintCost,
+        canPaint,
+        ammoCost: economy.ammoCost,
+        canAmmo,
+        ammoNote,
+        atGarage: atG,
+        garageNote: atG
+          ? i18n.t('shop.atGarage')
+          : i18n.t('shop.needGarage', { distance }),
+        upgrades,
+      },
+    };
+  }
+
+  // --- сохранение -----------------------------------------------------------
+
+  function collectProfile(): SaveProfile {
+    const missionProgress = missions.save();
+    return {
+      version: SAVE_VERSION,
+      money: economy.money,
+      upgrades: { ...economy.upgrades },
+      missions: {
+        completed: [...missionProgress.completed],
+        cooldowns: { ...missionProgress.cooldowns },
+      },
+      settings: { ...uiSettings },
+      stats: { ...statsState },
+      savedAt: Date.now(),
+    };
+  }
+
+  function saveGame(auto: boolean): boolean {
+    const ok = saveService.save(collectProfile());
+    if (!ok) {
+      if (!auto) {
+        toast.show(i18n.t('menu.noSave'), 'error', 2.4);
+        menu.setMessage(i18n.t('menu.noSave'), 'error');
+      }
+      return false;
+    }
+    if (auto) {
+      toast.show(i18n.t('toast.autoSave'), 'info', 1.6);
+    } else {
+      toast.show(i18n.t('menu.saved'), 'success', 2.2);
+      menu.setMessage(i18n.t('menu.saved'), 'success');
+    }
+    return true;
+  }
+
+  function applyProfile(profile: SaveProfile): void {
+    economy.restore({ money: profile.money, upgrades: profile.upgrades });
+    missions.restore({
+      completed: profile.missions.completed,
+      cooldowns: profile.missions.cooldowns,
+    });
+    statsState.missionsCompleted = profile.stats.missionsCompleted;
+    statsState.missionsFailed = profile.stats.missionsFailed;
+    statsState.playSeconds = profile.stats.playSeconds;
+    releaseMissionCar();
+
+    uiSettings.lang = profile.settings.lang;
+    uiSettings.volume = profile.settings.volume;
+    uiSettings.muted = profile.settings.muted;
+    uiSettings.quality = profile.settings.quality;
+    uiSettings.touch = profile.settings.touch;
+    uiSettings.hints = profile.settings.hints;
+
+    i18n.setLang(uiSettings.lang);
+    audio.setVolume(uiSettings.volume);
+    audio.setMuted(uiSettings.muted);
+    mobile.setMode(uiSettings.touch);
+    applyQuality();
+    menu.refresh();
+    updateHud();
+  }
+
+  function loadGame(): boolean {
+    const profile = saveService.load();
+    if (!profile) {
+      toast.show(i18n.t('menu.noSave'), 'error', 2.4);
+      menu.setMessage(i18n.t('menu.noSave'), 'error');
+      return false;
+    }
+    applyProfile(profile);
+    toast.show(i18n.t('menu.loaded'), 'success', 2.2);
+    return true;
+  }
+
+  function resetProgress(): void {
+    economy.reset();
+    missions.reset();
+    releaseMissionCar();
+    statsState.missionsCompleted = 0;
+    statsState.missionsFailed = 0;
+    statsState.playSeconds = 0;
+    saveService.clear();
+    pager.close();
+    toast.show(i18n.t('menu.resetDone'), 'success', 2.4);
+    updateHud();
+  }
+
+  // Смена языка перерисовывает все подписи без перезагрузки страницы.
+  i18n.onChange(() => {
+    hud.refreshLabels();
+    mobile.refreshLabels();
+    menu.refresh();
+    if (missions.pagerOpen) refreshPager();
+  });
 
   // --- отладочный API -------------------------------------------------------
   // window.__tmc доступен всегда: на нём висят смоук-тесты qa (M5).
@@ -1252,6 +2045,93 @@ export function bootstrap(): void {
           health: Number(wanted.health.toFixed(1)),
         };
       },
+      // --- M6: миссии, деньги, язык, сохранение, интерфейс -------------------
+      missions: () => {
+        const hudState = missions.hud();
+        const marker = missions.marker();
+        const progress = missions.save();
+        return {
+          active: missions.activeId ?? '',
+          phase: hudState ? hudState.phase : '',
+          distance: hudState ? Number(hudState.distance.toFixed(1)) : -1,
+          remaining: hudState && hudState.remaining !== null ? Number(hudState.remaining.toFixed(1)) : -1,
+          completed: progress.completed.length,
+          failed: missions.stats.failed,
+          markerX: marker ? Number(marker.x.toFixed(1)) : 0,
+          markerZ: marker ? Number(marker.z.toFixed(1)) : 0,
+          markerRadius: marker ? marker.radius : 0,
+          cooldowns: Object.keys(progress.cooldowns).length,
+        };
+      },
+      missionList: () => {
+        const list: Record<string, number | string>[] = [];
+        const statuses = missions.statuses();
+        for (let i = 0; i < statuses.length; i += 1) {
+          const entry = statuses[i];
+          list.push({
+            id: entry.def.id,
+            index: i + 1,
+            status: entry.status,
+            cooldown: Number(entry.cooldown.toFixed(1)),
+            reward: entry.def.reward,
+            type: entry.def.type,
+          });
+        }
+        return list;
+      },
+      startMission: (id) => (missions.start(id) ? 1 : 0),
+      money: () => economy.money,
+      addMoney: (amount) => {
+        economy.add(amount, 'debug');
+        return economy.money;
+      },
+      setLang: (lang) => {
+        if (lang === 'ru' || lang === 'en' || lang === 'tr') setLanguage(lang);
+        return i18n.lang;
+      },
+      saveGame: () => (saveGame(false) ? 1 : 0),
+      loadGame: () => (loadGame() ? 1 : 0),
+      buyUpgrade: (id) => {
+        if (!isUpgradeId(id)) return 0;
+        return economy.buyUpgrade(id).ok ? 1 : 0;
+      },
+      repairVehicle: () => (economy.repair(activeVehicleOrNull()).ok ? 1 : 0),
+      paintVehicle: () => (economy.paint().ok ? 1 : 0),
+      buyAmmo: () => (economy.buyAmmo().ok ? 1 : 0),
+      shop: () => ({
+        atGarage: atGarage() ? 1 : 0,
+        distance: Number(garageDistance().toFixed(1)),
+        repairCost: economy.repairCost(activeVehicleOrNull()),
+        paintCost: economy.paintCost,
+        ammoCost: economy.ammoCost,
+        ammoNeeded:
+          combat.magAmmo < combat.weaponSpec.mag || combat.reserveAmmo < combat.weaponSpec.reserve ? 1 : 0,
+        contacts: economy.level('contacts'),
+        garage: economy.level('garage'),
+        insurance: economy.level('insurance'),
+        rewardMultiplier: Number(economy.rewardMultiplier.toFixed(2)),
+        serviceDiscount: Number(economy.serviceDiscount.toFixed(2)),
+      }),
+      uiState: () => {
+        const hudState = missions.hud();
+        return {
+          money: economy.money,
+          lang: i18n.lang,
+          startScreen: menu.screen === 'start' ? 1 : 0,
+          pauseOpen: menu.screen === 'pause' ? 1 : 0,
+          pagerOpen: missions.pagerOpen ? 1 : 0,
+          mobile: mobile.isActive ? 1 : 0,
+          minimapWidth: minimap.canvas.width,
+          minimapHeight: minimap.canvas.height,
+          hudVisible: document.getElementById('tmc-hud') !== null ? 1 : 0,
+          missionPanel: hudState ? 1 : 0,
+          paused: loop.isPaused ? 1 : 0,
+          stars: wanted.level,
+          health: Number(wanted.health.toFixed(1)),
+          speedKmh: Number(frameStats.speedKmh.toFixed(1)),
+          statsVisible: statsElement && !statsElement.hidden ? 1 : 0,
+        };
+      },
     };
   }
 
@@ -1271,39 +2151,103 @@ export function bootstrap(): void {
    */
   // --- HUD ------------------------------------------------------------------
   let hudTimer = 0;
-  let lastHint = '';
+
+  /** Текст цели заказа: место и класс машины подставляются переводами. */
+  function missionObjectiveText(state: MissionHudState): string {
+    if (state.needVehicle) return i18n.t('mission.objective.needVehicle');
+    const place = i18n.t(state.placeKey);
+    if (state.objectiveKey === 'mission.objective.checkpoint') {
+      return i18n.t(state.objectiveKey, {
+        index: state.checkpointIndex,
+        total: state.checkpointTotal,
+        place,
+      });
+    }
+    if (state.vehicleClass) {
+      return i18n.t(state.objectiveKey, {
+        place,
+        class: i18n.t(`vehicle.${state.vehicleClass}`),
+      });
+    }
+    return i18n.t(state.objectiveKey, { place });
+  }
+
+  function hudMission(): HudMission | null {
+    const state = missions.hud();
+    if (!state) return null;
+    return {
+      title: i18n.t(state.titleKey),
+      objective: missionObjectiveText(state),
+      timer: state.remaining !== null ? i18n.formatTime(state.remaining) : null,
+      distance: i18n.t('mission.distance', { meters: Math.round(state.distance) }),
+      urgent: state.remaining !== null && state.remaining <= 15,
+    };
+  }
+
+  function buildPrompt(driving: boolean): string {
+    const missionHint = i18n.t('hud.prompt.mission');
+    if (driving) {
+      return `${i18n.t('hud.prompt.exit')} · ${i18n.t('hud.prompt.fire')} · ${missionHint}`;
+    }
+    const nearest = playerController.nearest;
+    const near = nearest
+      ? i18n.t('hud.prompt.nearCar', { car: i18n.t(`vehicle.${nearest.type}`) })
+      : '';
+    return `${i18n.t('hud.prompt.drive')}${near} · ${i18n.t('hud.prompt.foot')} · ${i18n.t('hud.prompt.fire')} · ${missionHint}`;
+  }
 
   function updateHud(): void {
-    lifeHud.update(
-      {
-        stars: wanted.level,
-        health: wanted.health,
-        weapon: combat.weaponSpec.label,
+    const driving = playerController.mode === 'driving';
+    const vehicle = driving ? playerController.vehicle : null;
+    const speed = vehicle
+      ? Math.hypot(vehicle.transform.vx, vehicle.transform.vz) * 3.6
+      : Math.hypot(playerTransform.vx, playerTransform.vz) * 3.6;
+
+    hud.update({
+      money: economy.money,
+      health: wanted.health,
+      maxHealth: WANTED.playerHealth,
+      stars: wanted.level,
+      speedKmh: speed,
+      weapon: {
+        labelKey: `weapon.${combat.weapon}`,
         mag: combat.magAmmo,
         reserve: combat.reserveAmmo,
         reloading: combat.isReloading,
-        driving: playerController.mode === 'driving',
       },
-      HUD_INTERVAL,
-    );
-    if (!hintElement) return;
-    const vehicle = playerController.mode === 'driving' ? playerController.vehicle : null;
-    const fightHint = 'ЛКМ — огонь · 1/2/3 — оружие · F — перезарядка · H — сигнал';
-    let text: string;
-    if (vehicle) {
-      const speed = Math.round(Math.hypot(vehicle.transform.vx, vehicle.transform.vz) * 3.6);
-      const hp = Math.round((vehicle.hp / vehicle.maxHp) * 100);
-      const state = vehicle.wrecked ? ' · уничтожена' : '';
-      text = `${vehicle.config.label} · ${vehicle.type} · HP ${hp}%${state} · ${speed} км/ч · E — выйти · R — на дорогу · ${fightHint}`;
-    } else {
-      const nearest = playerController.nearest;
-      const carHint = nearest ? ` · рядом: ${nearest.config.label}` : '';
-      text = `Пешком · E — сесть в машину${carHint} · WASD — идти · ${fightHint}`;
+      mission: hudMission(),
+      prompt: uiSettings.hints ? buildPrompt(driving) : null,
+    });
+
+    // Мини-карта: игрок, копы, маркер заказа и гараж (точка услуг).
+    const position = playerWorldPosition();
+    const cops: { x: number; z: number }[] = [];
+    for (let i = 0; i < fleet.list.length; i += 1) {
+      const car = fleet.list[i];
+      if (car.type === 'police') cops.push({ x: car.transform.x, z: car.transform.z });
     }
-    if (text !== lastHint) {
-      hintElement.textContent = text;
-      lastHint = text;
+    const markers: MinimapMarker[] = [];
+    const marker = missions.marker();
+    if (marker) {
+      markers.push({
+        x: marker.x,
+        z: marker.z,
+        kind:
+          marker.kind === 'toStart'
+            ? 'start'
+            : marker.kind === 'checkpoint'
+              ? 'checkpoint'
+              : 'target',
+      });
     }
+    markers.push({ x: ECONOMY.garage[0], z: ECONOMY.garage[1], kind: 'garage' });
+    minimap.update({
+      playerX: position.x,
+      playerZ: position.z,
+      playerHeading: vehicle ? vehicle.transform.heading : playerTransform.heading,
+      cops,
+      markers,
+    });
   }
 
   // --- фикс. шаг ------------------------------------------------------------
@@ -1326,20 +2270,39 @@ export function bootstrap(): void {
     // BUG-M4-006: ввод читается ровно один раз за фиксированный шаг.
     // Все системы получают уже готовый inputState, повторных read() нет.
     input.read(inputState);
+    // Мобильные контролы домешиваются в тот же снимок: физика не различает
+    // источник ввода. Фронты тача забираем здесь же.
+    mobile.apply(inputState);
+    if (mobile.consumeInteract()) interactRequested = true;
+    if (mobile.consumeFirePressed()) firePressed = true;
     inputReads += 1;
     logicSteps += 1;
     gameTime += dt;
+    statsState.playSeconds += dt;
+    if (stealTimer > 0) stealTimer = Math.max(0, stealTimer - dt);
     if (inputState.reset) resetActiveTarget();
 
     if (interactRequested) {
       interactRequested = false;
-      toggleVehicle();
+      const changed = toggleVehicle();
       // Угон трафика/полицейской машины: система перестаёт ею управлять,
       // дальше машину ведёт ввод игрока (иначе двойная физика).
       const stolen = playerController.vehicle;
-      if (stolen) {
+      if (changed && stolen) {
+        const wasManaged = traffic.owns(stolen.id) || wanted.owns(stolen.id);
         traffic.forget(stolen.id);
         wanted.releaseVehicle(stolen.id);
+        if (wasManaged && stealTimer <= 0) {
+          economy.add(ECONOMY.stealReward, 'steal');
+          stealTimer = ECONOMY.stealCooldown;
+          toast.show(
+            i18n.t('toast.steal', {
+              reward: `${i18n.t('hud.currency')}${i18n.formatNumber(ECONOMY.stealReward)}`,
+            }),
+            'success',
+            2,
+          );
+        }
       }
     }
 
@@ -1377,8 +2340,9 @@ export function bootstrap(): void {
     if (hornRequested) {
       hornRequested = false;
       peds.alertAt(playerSnapshot.x, playerSnapshot.z, HORN_RADIUS, 'alert');
+      audio.horn();
     }
-    if (fireHeld && (firePressed || combat.weaponSpec.auto)) firePlayerWeapon();
+    if ((fireHeld || mobile.fireHeld) && (firePressed || combat.weaponSpec.auto)) firePlayerWeapon();
     firePressed = false;
 
     // --- физика: игрок и припаркованные; ИИ-машины уже шагнули себя ----------
@@ -1407,6 +2371,15 @@ export function bootstrap(): void {
       wanted.level,
       wanted.sirenNear,
     );
+
+    // --- миссии: этапы, таймеры, награда/провал ------------------------------
+    missionPlayer.x = driven ? driven.transform.x : playerTransform.x;
+    missionPlayer.z = driven ? driven.transform.z : playerTransform.z;
+    missionPlayer.inVehicle = driven !== null;
+    missionPlayer.vehicleType = driven ? driven.type : null;
+    missionPlayer.vehicleWrecked = driven ? driven.wrecked : false;
+    missionPlayer.vehicleId = driven ? driven.id : -1;
+    missions.update(dt, missionPlayer);
 
     // Отдача оружия и импульс машины → тряска камеры; взрывы без крови.
     if (combat.recoil > 0.01) {
@@ -1474,6 +2447,27 @@ export function bootstrap(): void {
     followCamera.update(frameDt, renderX, renderZ, target.vx, target.vz);
     applyCamera();
 
+    // Маркер заказа: кольцо зоны на земле, цвет по этапу.
+    const missionMarker = missions.marker();
+    if (missionMarker) {
+      missionMarkerView.set(
+        missionMarker.x,
+        missionMarker.z,
+        missionMarker.radius,
+        missionMarker.kind === 'toStart' ? 0x4dabf7 : 0xffa94d,
+      );
+    } else {
+      missionMarkerView.hide();
+    }
+    missionMarkerView.update(frameDt);
+
+    // Сирена и визг шин идут от состояния, а не от событий: нет сирены — тишина.
+    const sirenDistance = wanted.sirenNear
+      ? Math.hypot(wanted.sirenPositionX - renderX, wanted.sirenPositionZ - renderZ)
+      : 0;
+    audio.siren(wanted.sirenNear && wanted.level > 0, sirenDistance);
+    audio.update(frameDt);
+
     sun.position.set(renderX + 55, 105, renderZ + 40);
     sun.target.position.set(renderX, 0, renderZ);
     sun.target.updateMatrixWorld();
@@ -1517,6 +2511,19 @@ export function bootstrap(): void {
       updateHud();
     }
 
+    // Мобильный стик сглаживается в кадре рендера, а не в фикс. шаге.
+    mobile.update(frameDt);
+    toast.update(frameDt);
+
+    // Автосохранение: раз в ECONOMY.autosaveInterval секунд, только в игре.
+    if (ECONOMY.autosaveInterval > 0 && !loop.isPaused) {
+      autosaveTimer += frameDt;
+      if (autosaveTimer >= ECONOMY.autosaveInterval) {
+        autosaveTimer = 0;
+        saveGame(true);
+      }
+    }
+
     debug.update(frameDt, frameStats);
   }
 
@@ -1527,29 +2534,28 @@ export function bootstrap(): void {
     maxFrameDelta: TUNING.maxFrameDelta,
   });
 
-  events.on('pause', (event) => {
-    if (event.paused) {
-      loop.pause();
-      input.clear();
-    } else {
-      loop.resume();
-    }
+  // Пауза — набор причин: фокус, меню, пейджер, стартовый экран.
+  window.addEventListener('blur', () => {
+    pauseBlur = true;
+    applyPauseState();
   });
-
-  function setPaused(paused: boolean): void {
-    events.emit('pause', { paused });
-  }
-
-  window.addEventListener('blur', () => setPaused(true));
   window.addEventListener('focus', () => {
-    if (!document.hidden) setPaused(false);
+    if (document.hidden) return;
+    pauseBlur = false;
+    applyPauseState();
   });
-  document.addEventListener('visibilitychange', () => setPaused(document.hidden));
+  document.addEventListener('visibilitychange', () => {
+    pauseBlur = document.hidden;
+    applyPauseState();
+  });
 
   function resize(): void {
     const width = window.innerWidth;
     const height = window.innerHeight;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const preset = UI.quality[uiSettings.quality];
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, preset.pixelRatio));
+    renderer.shadowMap.enabled = preset.shadows;
+    sun.castShadow = preset.shadows;
     renderer.setSize(width, height);
     followCamera.resize(width, height);
 
@@ -1559,6 +2565,7 @@ export function bootstrap(): void {
     camera.top = frustum.top;
     camera.bottom = frustum.bottom;
     camera.updateProjectionMatrix();
+    minimap.resize();
   }
 
   window.addEventListener('resize', resize);
@@ -1566,7 +2573,16 @@ export function bootstrap(): void {
   const loadingElement = document.getElementById('loading');
   if (loadingElement) loadingElement.classList.add('hidden');
 
+  // Стартовый экран: игра стоит на паузе, пока игрок не нажмёт «Играть».
+  menu.openStart();
+  pauseStart = true;
+  applyPauseState();
   updateHud();
+  // Один кадр под стартовым экраном: город уже виден, а не чёрный фон.
+  renderFrame(0, 1 / 60);
   loop.start();
-  if (document.hidden) setPaused(true);
+  if (document.hidden) {
+    pauseBlur = true;
+    applyPauseState();
+  }
 }

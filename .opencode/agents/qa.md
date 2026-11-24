@@ -2,7 +2,7 @@
 description: QA TakeMyCar — тесты, производительность, утечки, смоук в браузере; только чтение и запуск проверок
 mode: subagent
 color: "#9aa0a6"
-steps: 70
+steps: 80
 permissions:
   - action: edit
     resource: "*"
