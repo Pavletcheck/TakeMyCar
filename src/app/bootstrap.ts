@@ -11,12 +11,15 @@ import type { EntityId } from '../core/registry';
 import { createRng } from '../core/rng';
 import { SpatialHash } from '../core/spatialHash';
 import { createCityView } from '../render/cityView';
+import { createEffectsView } from '../render/effectsView';
+import { createNpcView } from '../render/npcView';
 import { createPlayerView } from '../render/playerView';
 import { createVehicleView } from '../render/vehicleView';
 import { TUNING } from '../config/tuning';
 import { WORLD } from '../config/world';
 import { VEHICLE_TYPES, isVehicleType, vehicleColliderRadius } from '../config/vehicles';
 import { PLAYER } from '../config/player';
+import { WANTED, WEAPON_ORDER } from '../config/life';
 import type { VehicleTypeId } from '../config/vehicles';
 import {
   VehicleFleet,
@@ -27,14 +30,20 @@ import {
   repairVehicleFull,
 } from '../entities/vehicle';
 import type { VehicleState } from '../entities/vehicle';
+import { NpcPool } from '../entities/npc';
 import { IDLE_VEHICLE_INPUT, VehiclePhysics } from '../systems/vehiclePhysics';
 import { createVehicleAudio } from '../systems/vehicleAudio';
 import { PlayerController } from '../systems/playerController';
+import { TrafficSystem } from '../systems/traffic';
+import { PedsSystem } from '../systems/peds';
+import { CombatSystem } from '../systems/combat';
+import { WantedSystem } from '../systems/wanted';
 import { DEFAULT_MAP_ID, loadCityMap } from '../world/mapLoader';
 import { serializeRoadGraph } from '../world/roadGraph';
 import type { SpawnPoint } from '../world/types';
 import { buildWorldFromMap } from '../world/world';
 import { createDebugStats, DebugOverlay } from './debug';
+import { createLifeHud } from './lifeHud';
 
 // ---------------------------------------------------------------------------
 // M4. Композиционный корень: мир, флот машин, игрок (за рулём и пешком),
@@ -64,6 +73,13 @@ const CITY_CAR_CLEAR_RADIUS = 3;
 const CITY_CAR_TYPES: readonly VehicleTypeId[] = ['sports', 'van', 'truck', 'sedan', 'sports', 'van'];
 /** Период обновления текстового HUD, с. */
 const HUD_INTERVAL = 0.1;
+/** Лимит машин во флоте: 60 трафика + 8 копов + городские + игрок. */
+const FLEET_VISUAL_LIMIT = 128;
+/** Сколько трафика и пешеходов ставим сразу на старте (безопасная зона). */
+const TRAFFIC_PREFILL = 14;
+const PEDS_PREFILL = 44;
+/** Радиус сигнала: пешеходы реагируют на гудок. */
+const HORN_RADIUS = 20;
 /** Полный газ для отладочного замера разгона. */
 const FULL_THROTTLE = Object.freeze({ throttle: 1, brake: 0, steer: 0, handbrake: false });
 /** Тряска камеры при ударе: длительность и амплитуда. */
@@ -129,6 +145,18 @@ interface TmcDebugApi {
   speedProbe(): Record<string, number | string>;
   /** Состояние стресс-режима: якорь и максимальное удаление тел от него. */
   stressState(): Record<string, number>;
+  /** M5: розыск, копы, здоровье игрока. */
+  wanted(): Record<string, number | string>;
+  /** M5: выставить уровень розыска 0..5 (отладка и смоук). */
+  setWanted(level: number): number;
+  /** M5: счётчики трафика и бюджета его апдейта. */
+  trafficStats(): Record<string, number>;
+  /** M5: счётчики пешеходов по состояниям. */
+  pedStats(): Record<string, number>;
+  /** M5: спавн копа рядом (без координат — у игрока). */
+  spawnCop(x?: number, z?: number): number;
+  /** M5: оружие, патроны, перезарядка, отдача. */
+  combatState(): Record<string, number | string>;
 }
 
 declare global {
@@ -155,6 +183,7 @@ export function bootstrap(): void {
   const inputState = createInputState();
   const debug = new DebugOverlay(document.getElementById('stats'));
   const hintElement = document.getElementById('hint');
+  const lifeHud = createLifeHud(document.getElementById('hud'));
   const frameStats = createDebugStats();
   frameStats.seed = seed;
   frameStats.mapId = map.id;
@@ -453,7 +482,7 @@ export function bootstrap(): void {
 
   // --- город (меши по чанкам) ----------------------------------------------
   const cityView = createCityView(scene, world.config);
-  const vehicleView = createVehicleView(scene, { maxVehicles: 96 });
+  const vehicleView = createVehicleView(scene, { maxVehicles: FLEET_VISUAL_LIMIT });
   const playerView = createPlayerView(scene);
 
   // --- камера --------------------------------------------------------------
@@ -522,6 +551,157 @@ export function bootstrap(): void {
     playerTransform,
   );
   playerController.startInVehicle(startVehicle);
+
+  // --- жизнь города (M5): трафик, пешеходы, полиция, оружие ----------------
+  // Порядок создания: физика уже есть, машины копов и трафика используют её.
+  const effectsView = createEffectsView(scene);
+  const npcView = createNpcView(scene);
+  /** Отдельный пул для пеших копов: пешеходов не вытесняют. */
+  const copPool = new NpcPool(WANTED.maxCops + 8);
+  const blockRects = world.map.blocks.map((block) => block.rect);
+
+  const traffic = new TrafficSystem({
+    registry,
+    fleet,
+    hash: colliderHash,
+    graph: world.roadGraph,
+    physics,
+    bounds: world.bounds,
+    seed: world.seed ^ 0x7a11,
+  });
+  const peds = new PedsSystem({
+    registry,
+    fleet,
+    hash: colliderHash,
+    blocks: blockRects,
+    water: world.map.water,
+    bounds: world.bounds,
+    playerId: player.id,
+    seed: world.seed ^ 0x51ed,
+  });
+  const combat = new CombatSystem({
+    hash: colliderHash,
+    fleet,
+    pools: [peds.pool, copPool],
+    playerId: player.id,
+    seed: world.seed ^ 0xc0ff,
+  });
+  const wanted = new WantedSystem({
+    registry,
+    fleet,
+    hash: colliderHash,
+    graph: world.roadGraph,
+    physics,
+    combat,
+    npcPool: copPool,
+    playerId: player.id,
+    seed: world.seed ^ 0x9a71,
+  });
+
+  // Связка систем: преступления, паника, эффекты. Системы не знают друг о друге.
+  peds.onCrime = (kind, x, z) => wanted.addCrime(kind, x, z);
+  combat.onCrime = (kind, x, z) => wanted.addCrime(kind, x, z);
+  combat.onGunshot = (x, z) => peds.gunshot(x, z);
+  combat.onShot = (x1, z1, x2, z2, hit) => effectsView.tracer(x1, z1, x2, z2, hit);
+  combat.onImpact = (x, z, hit) => effectsView.impact(x, z, hit);
+  traffic.onHonk = (x, z) => peds.alertAt(x, z, 16, 'alert');
+  wanted.onLevelChanged = (level) => {
+    lifeHud.notify(level > 0 ? `Розыск ${level}` : 'Розыск снят');
+  };
+  wanted.onPlayerCaught = (reason) => {
+    // Арест или «выведен из строя»: игрок в безопасную точку, розыск сброшен.
+    const point = pickRespawn(spawn.x, spawn.z, 3.5);
+    const vehicle = playerController.vehicle;
+    if (playerController.mode === 'driving' && vehicle) {
+      repositionVehicle(registry, vehicle, point.x, point.z, point.heading);
+      repairVehicleFull(vehicle);
+      playerController.syncInsideVehicle();
+    } else {
+      playerController.teleport(point.x, point.z);
+    }
+    followCamera.snapTo(point.x, point.z);
+    world.prefetch(point.x, point.z);
+    shakeTime = 0;
+    wanted.reset();
+    lifeHud.notify(reason === 'arrest' ? 'Арест! Розыск снят' : 'Выведен из строя');
+  };
+
+  // Стартовое население: только за пределами безопасной зоны.
+  traffic.prefill(TRAFFIC_PREFILL, spawn.x, spawn.z);
+  peds.prefill(PEDS_PREFILL, spawn.x, spawn.z);
+
+  /** Переиспользуемый снимок игрока: без аллокаций в фиксированном шаге. */
+  const playerSnapshot = {
+    x: spawn.x,
+    z: spawn.z,
+    vx: 0,
+    vz: 0,
+    heading: spawn.heading,
+    onFoot: false,
+    vehicle: startVehicle as VehicleState | null,
+  };
+  /** Контекст трафика: уровень розыска и ближайшая сирена. */
+  const trafficContext = { wantedLevel: 0, sirenX: 0, sirenZ: 0 };
+  let gameTime = 0;
+  let fireHeld = false;
+  let firePressed = false;
+  let reloadRequested = false;
+  let hornRequested = false;
+  let weaponRequest = -1;
+  const pointer = { x: 0, y: 0 };
+  const raycaster = new THREE.Raycaster();
+  const aimPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const aimPoint = new THREE.Vector3();
+  const aimNdc = new THREE.Vector2();
+
+  /** Прицел по мыши: экран → точка на земле через ортокамеру. */
+  function aimAtGround(): boolean {
+    aimNdc.set(pointer.x, pointer.y);
+    raycaster.setFromCamera(aimNdc, camera);
+    return raycaster.ray.intersectPlane(aimPlane, aimPoint) !== null;
+  }
+
+  /** Выстрел игрока: из машины — от капота, пешком — от игрока. */
+  function firePlayerWeapon(): void {
+    const vehicle = playerController.mode === 'driving' ? playerController.vehicle : null;
+    let originX = vehicle ? vehicle.transform.x : playerTransform.x;
+    let originZ = vehicle ? vehicle.transform.z : playerTransform.z;
+    if (vehicle) {
+      // Дуло на капоте: не стреляем в собственный кузов.
+      originX += Math.sin(vehicle.transform.heading) * (vehicle.config.length * 0.5 + 0.4);
+      originZ += Math.cos(vehicle.transform.heading) * (vehicle.config.length * 0.5 + 0.4);
+    }
+    if (!aimAtGround()) return;
+    let dirX = aimPoint.x - originX;
+    let dirZ = aimPoint.z - originZ;
+    const length = Math.hypot(dirX, dirZ);
+    if (length < 0.4) return;
+    dirX /= length;
+    dirZ /= length;
+    combat.tryFire(originX, originZ, dirX, dirZ, vehicle ? vehicle.id : -1);
+  }
+
+  // --- ввод M5: огонь ЛКМ, оружие 1/2/3, перезарядка F, сигнал H ------------
+  function updatePointer(event: MouseEvent): void {
+    pointer.x = (event.clientX / window.innerWidth) * 2 - 1;
+    pointer.y = -(event.clientY / window.innerHeight) * 2 + 1;
+  }
+
+  const onMouseDown = (event: MouseEvent): void => {
+    if (event.button !== 0) return;
+    updatePointer(event);
+    fireHeld = true;
+    firePressed = true;
+  };
+  const onMouseUp = (event: MouseEvent): void => {
+    if (event.button === 0) fireHeld = false;
+  };
+  const onMouseMove = (event: MouseEvent): void => updatePointer(event);
+
+  window.addEventListener('mousedown', onMouseDown);
+  window.addEventListener('mouseup', onMouseUp);
+  window.addEventListener('mousemove', onMouseMove);
+  window.addEventListener('contextmenu', (event) => event.preventDefault());
 
   const spawnQuery: SpawnPoint[] = [];
   /** Запас к габариту при проверке свободного места под респавн, м. */
@@ -612,11 +792,24 @@ export function bootstrap(): void {
     return true;
   }
 
-  // E не входит в общий InputMap ядра: добавляем одноразовое действие здесь,
-  // чтобы не менять контракт core/input в M4.
+  // E/H/F/1..3 не входят в общий InputMap ядра: добавляем одноразовые
+  // действия здесь, чтобы не менять контракт core/input в M4/M5.
   let interactRequested = false;
   const onKeyDown = (event: KeyboardEvent): void => {
-    if (event.code === 'KeyE' && !event.repeat) interactRequested = true;
+    if (event.repeat) return;
+    if (event.code === 'KeyE') {
+      interactRequested = true;
+    } else if (event.code === 'KeyH') {
+      hornRequested = true;
+    } else if (event.code === 'KeyF') {
+      reloadRequested = true;
+    } else if (event.code === 'Digit1') {
+      weaponRequest = 0;
+    } else if (event.code === 'Digit2') {
+      weaponRequest = 1;
+    } else if (event.code === 'Digit3') {
+      weaponRequest = 2;
+    }
   };
   window.addEventListener('keydown', onKeyDown);
 
@@ -691,28 +884,25 @@ export function bootstrap(): void {
   cityView.sync(world);
 
   // --- отладочный API -------------------------------------------------------
-  if (debugWorld) {
-    const layoutHash = world.layoutHash;
-    const info = world.info;
-    frameStats.layoutHash = layoutHash;
-    frameStats.mapId = world.mapId;
-    frameStats.roads = info.roads;
-    frameStats.blocks = info.blocks;
-    frameStats.landmarks = info.landmarks;
-
+  // window.__tmc доступен всегда: на нём висят смоук-тесты qa (M5).
+  // Тяжёлая диагностика мира (layoutHash, info) считается только под ?debug=1.
+  {
     const activeVehicle = (): VehicleState | null => playerController.vehicle ?? fleet.list[0] ?? null;
 
     window.__tmc = {
       mapId: world.mapId,
       seed,
-      layoutHash,
+      get layoutHash() {
+        return world.layoutHash;
+      },
       exportRoadGraph: () => serializeRoadGraph(world.roadGraph),
       stats: () => {
         const stats = world.stats;
+        const info = world.info;
         return {
           mapId: world.mapId,
           seed,
-          layoutHash,
+          layoutHash: world.layoutHash,
           roads: info.roads,
           blocks: info.blocks,
           landmarks: info.landmarks,
@@ -992,7 +1182,87 @@ export function bootstrap(): void {
           perCarMs: Number((total > 0 ? avgMs / total : 0).toFixed(4)),
         };
       },
+      // --- M5: жизнь города -------------------------------------------------
+      wanted: () => {
+        const stats = wanted.stats;
+        return {
+          level: stats.level,
+          heat: Number(stats.heat.toFixed(1)),
+          cars: stats.cars,
+          foot: stats.foot,
+          health: Number(stats.health.toFixed(1)),
+          seen: stats.seen,
+          unseen: Number(stats.unseen.toFixed(1)),
+          arrests: stats.arrests,
+          spawned: stats.spawned,
+          despawned: stats.despawned,
+          copShots: stats.copShots,
+          copHits: stats.copHits,
+          nearestCar: Number(stats.nearestCar.toFixed(1)),
+          nearestFoot: Number(stats.nearestFoot.toFixed(1)),
+          updateMs: Number(stats.updateMs.toFixed(3)),
+          maxUpdateMs: Number(stats.maxUpdateMs.toFixed(3)),
+        };
+      },
+      setWanted: (level) => {
+        wanted.setLevel(level);
+        return wanted.level;
+      },
+      trafficStats: () => {
+        const stats = traffic.stats;
+        return {
+          vehicles: stats.vehicles,
+          near: stats.near,
+          stopped: stats.stopped,
+          avgSpeed: Number(stats.avgSpeed.toFixed(2)),
+          spawned: stats.spawned,
+          despawned: stats.despawned,
+          updateMs: Number(stats.updateMs.toFixed(3)),
+          maxUpdateMs: Number(stats.maxUpdateMs.toFixed(3)),
+        };
+      },
+      pedStats: () => {
+        const stats = peds.stats;
+        return {
+          total: stats.total,
+          near: stats.near,
+          idle: stats.idle,
+          walk: stats.walking,
+          alert: stats.alert,
+          flee: stats.fleeing,
+          panic: stats.panic,
+          down: stats.down,
+          knocked: stats.knocked,
+          spawned: stats.spawned,
+          despawned: stats.despawned,
+          updateMs: Number(stats.updateMs.toFixed(3)),
+          maxUpdateMs: Number(stats.maxUpdateMs.toFixed(3)),
+        };
+      },
+      spawnCop: (x, z) => wanted.spawnCop(x, z),
+      combatState: () => {
+        return {
+          weapon: combat.weapon,
+          label: combat.weaponSpec.label,
+          mag: combat.magAmmo,
+          reserve: combat.reserveAmmo,
+          reloading: combat.isReloading ? 1 : 0,
+          recoil: Number(combat.recoil.toFixed(2)),
+          wanted: wanted.level,
+          health: Number(wanted.health.toFixed(1)),
+        };
+      },
     };
+  }
+
+  // Диагностика мира в оверлее — только под ?debug=1 (дорогой layoutHash).
+  if (debugWorld) {
+    frameStats.layoutHash = world.layoutHash;
+    frameStats.mapId = world.mapId;
+    const info = world.info;
+    frameStats.roads = info.roads;
+    frameStats.blocks = info.blocks;
+    frameStats.landmarks = info.landmarks;
   }
 
   /**
@@ -1004,18 +1274,31 @@ export function bootstrap(): void {
   let lastHint = '';
 
   function updateHud(): void {
+    lifeHud.update(
+      {
+        stars: wanted.level,
+        health: wanted.health,
+        weapon: combat.weaponSpec.label,
+        mag: combat.magAmmo,
+        reserve: combat.reserveAmmo,
+        reloading: combat.isReloading,
+        driving: playerController.mode === 'driving',
+      },
+      HUD_INTERVAL,
+    );
     if (!hintElement) return;
     const vehicle = playerController.mode === 'driving' ? playerController.vehicle : null;
+    const fightHint = 'ЛКМ — огонь · 1/2/3 — оружие · F — перезарядка · H — сигнал';
     let text: string;
     if (vehicle) {
       const speed = Math.round(Math.hypot(vehicle.transform.vx, vehicle.transform.vz) * 3.6);
       const hp = Math.round((vehicle.hp / vehicle.maxHp) * 100);
       const state = vehicle.wrecked ? ' · уничтожена' : '';
-      text = `${vehicle.config.label} · ${vehicle.type} · HP ${hp}%${state} · ${speed} км/ч · E — выйти · R — на дорогу`;
+      text = `${vehicle.config.label} · ${vehicle.type} · HP ${hp}%${state} · ${speed} км/ч · E — выйти · R — на дорогу · ${fightHint}`;
     } else {
       const nearest = playerController.nearest;
       const carHint = nearest ? ` · рядом: ${nearest.config.label}` : '';
-      text = `Пешком · E — сесть в машину${carHint} · WASD — идти · R — на дорогу`;
+      text = `Пешком · E — сесть в машину${carHint} · WASD — идти · ${fightHint}`;
     }
     if (text !== lastHint) {
       hintElement.textContent = text;
@@ -1045,27 +1328,91 @@ export function bootstrap(): void {
     input.read(inputState);
     inputReads += 1;
     logicSteps += 1;
+    gameTime += dt;
     if (inputState.reset) resetActiveTarget();
 
     if (interactRequested) {
       interactRequested = false;
       toggleVehicle();
+      // Угон трафика/полицейской машины: система перестаёт ею управлять,
+      // дальше машину ведёт ввод игрока (иначе двойная физика).
+      const stolen = playerController.vehicle;
+      if (stolen) {
+        traffic.forget(stolen.id);
+        wanted.releaseVehicle(stolen.id);
+      }
     }
 
     if (playerController.mode === 'driving') playerController.syncInsideVehicle();
     else playerController.stepFoot(dt, inputState);
 
     const driven = playerController.mode === 'driving' ? playerController.vehicle : null;
+
+    // --- снимок игрока для систем жизни --------------------------------------
+    playerSnapshot.x = driven ? driven.transform.x : playerTransform.x;
+    playerSnapshot.z = driven ? driven.transform.z : playerTransform.z;
+    playerSnapshot.vx = driven ? driven.transform.vx : playerTransform.vx;
+    playerSnapshot.vz = driven ? driven.transform.vz : playerTransform.vz;
+    playerSnapshot.heading = driven ? driven.transform.heading : playerTransform.heading;
+    playerSnapshot.onFoot = playerController.mode === 'foot';
+    playerSnapshot.vehicle = driven;
+
+    trafficContext.wantedLevel = wanted.level;
+    trafficContext.sirenX = wanted.sirenPositionX;
+    trafficContext.sirenZ = wanted.sirenPositionZ;
+
+    // --- ИИ до физики: агенты шагают себя сами (owns) ------------------------
+    traffic.update(dt, gameTime, playerSnapshot.x, playerSnapshot.z, trafficContext);
+    wanted.update(dt, playerSnapshot);
+    combat.update(dt);
+
+    if (weaponRequest >= 0) {
+      combat.selectWeapon(WEAPON_ORDER[weaponRequest]);
+      weaponRequest = -1;
+    }
+    if (reloadRequested) {
+      reloadRequested = false;
+      combat.reload();
+    }
+    if (hornRequested) {
+      hornRequested = false;
+      peds.alertAt(playerSnapshot.x, playerSnapshot.z, HORN_RADIUS, 'alert');
+    }
+    if (fireHeld && (firePressed || combat.weaponSpec.auto)) firePlayerWeapon();
+    firePressed = false;
+
+    // --- физика: игрок и припаркованные; ИИ-машины уже шагнули себя ----------
     const physicsStarted = performance.now();
     for (let i = 0; i < fleet.list.length; i += 1) {
       const vehicle = fleet.list[i];
-      physics.step(vehicle, vehicle === driven ? inputState : IDLE_VEHICLE_INPUT, dt);
+      if (vehicle === driven) {
+        physics.step(vehicle, inputState, dt);
+        continue;
+      }
+      if (traffic.owns(vehicle.id) || wanted.owns(vehicle.id)) continue;
+      physics.step(vehicle, IDLE_VEHICLE_INPUT, dt);
     }
     const physicsMs = performance.now() - physicsStarted;
     if (physicsMs > physMsMax) physMsMax = physicsMs;
     updateStressMovers(dt);
 
-    // Импульс активной машины → тряска камеры; взрывы → вспышка без крови.
+    // --- пешеходы: после физики, чтобы видеть итоговые позиции машин ---------
+    peds.update(
+      dt,
+      gameTime,
+      playerSnapshot.x,
+      playerSnapshot.z,
+      wanted.sirenPositionX,
+      wanted.sirenPositionZ,
+      wanted.level,
+      wanted.sirenNear,
+    );
+
+    // Отдача оружия и импульс машины → тряска камеры; взрывы без крови.
+    if (combat.recoil > 0.01) {
+      shakePower = Math.max(shakePower, clamp(combat.recoil, 0.15, SHAKE_MAX) * 0.5);
+      shakeTime = Math.max(shakeTime, SHAKE_DURATION * 0.5);
+    }
     if (driven && driven.impactPulse > 0) {
       shakePower = clamp(driven.impactPulse / 18, 0.2, SHAKE_MAX);
       shakeTime = SHAKE_DURATION;
@@ -1108,6 +1455,8 @@ export function bootstrap(): void {
     const renderZ = lerp(target.prevZ, target.z, alpha);
 
     vehicleView.sync(fleet.list, alpha, frameDt);
+    npcView.sync(peds.pool.list, copPool.list, alpha, frameDt);
+    effectsView.sync(frameDt);
     const footX = lerp(playerTransform.prevX, playerTransform.x, alpha);
     const footZ = lerp(playerTransform.prevZ, playerTransform.z, alpha);
     const footHeading = lerpAngle(playerTransform.prevHeading, playerTransform.heading, alpha);
