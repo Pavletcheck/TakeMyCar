@@ -16,6 +16,11 @@ export function setViewFocus(x: number, z: number): void {
   focus.z = z;
 }
 
+/** Текущий центр интереса (только чтение: объект переиспользуется). */
+export function getViewFocus(): Readonly<{ x: number; z: number }> {
+  return focus;
+}
+
 /** Квадрат расстояния от точки до центра интереса, м². */
 export function focusDistanceSq(x: number, z: number): number {
   const dx = x - focus.x;

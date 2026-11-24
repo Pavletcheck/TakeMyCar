@@ -48,6 +48,15 @@ import propBillboardB from '../../assets/models/prop_billboard_b.glb?url';
 import propBillboardC from '../../assets/models/prop_billboard_c.glb?url';
 import propFenceA from '../../assets/models/prop_fence_a.glb?url';
 import propFenceB from '../../assets/models/prop_fence_b.glb?url';
+// Готовые дома (M7.1): 4 бакета по высоте, LOD0/LOD1.
+import bldSmallLod0 from '../../assets/models/bld_block_small_lod0.glb?url';
+import bldSmallLod1 from '../../assets/models/bld_block_small_lod1.glb?url';
+import bldMidLod0 from '../../assets/models/bld_block_mid_lod0.glb?url';
+import bldMidLod1 from '../../assets/models/bld_block_mid_lod1.glb?url';
+import bldTallLod0 from '../../assets/models/bld_block_tall_lod0.glb?url';
+import bldTallLod1 from '../../assets/models/bld_block_tall_lod1.glb?url';
+import bldTowerLod0 from '../../assets/models/bld_tower_lod0.glb?url';
+import bldTowerLod1 from '../../assets/models/bld_tower_lod1.glb?url';
 
 /** Одна часть модели: геометрия в осях узла и матрица узла (пивот). */
 export interface ModelPart {
@@ -86,6 +95,17 @@ export const PROP_MODEL_URLS: Readonly<Record<string, string>> = {
   'billboard:2': propBillboardC,
   'fence:0': propFenceA,
   'fence:1': propFenceB,
+};
+
+/**
+ * Готовые дома: выбор по высоте здания (см. `BUILDING_BUCKETS` в cityView).
+ * Ключи — имена бакетов, значение — LOD0/LOD1.
+ */
+export const BUILDING_MODEL_URLS: Readonly<Record<string, { lod0: string; lod1: string }>> = {
+  small: { lod0: bldSmallLod0, lod1: bldSmallLod1 },
+  mid: { lod0: bldMidLod0, lod1: bldMidLod1 },
+  tall: { lod0: bldTallLod0, lod1: bldTallLod1 },
+  tower: { lod0: bldTowerLod0, lod1: bldTowerLod1 },
 };
 
 interface CacheEntry {
