@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------------------
-// M6. HUD: деньги, здоровье, звёзды розыска, скорость, оружие/патроны,
-// панель активного заказа с таймером и подсказка управления.
+// M6/M8. HUD: деньги, здоровье, звёзды розыска, скорость, оружие/патроны,
+// панель активного заказа и одной строкой — событие/подработка (R-03),
+// счётчики коллекций.
 //
 // HUD не читает системы напрямую: app раз в 0.1 с собирает снимок состояния
 // и передаёт его в update(). DOM трогаем только при изменении значений.
@@ -25,6 +26,20 @@ export interface HudMission {
   readonly urgent: boolean;
 }
 
+export type HudActivityKind = 'job' | 'event';
+
+/** Случайное событие или подработка — вторая строка той же панели. */
+export interface HudActivity {
+  readonly kind: HudActivityKind;
+  readonly tag: string;
+  readonly title: string;
+  readonly objective: string;
+  readonly timer: string | null;
+  readonly distance: string | null;
+  readonly progress: string | null;
+  readonly urgent: boolean;
+}
+
 export interface HudState {
   readonly money: number;
   readonly health: number;
@@ -33,6 +48,9 @@ export interface HudState {
   readonly speedKmh: number;
   readonly weapon: HudWeapon;
   readonly mission: HudMission | null;
+  readonly activity: HudActivity | null;
+  /** Счётчики коллекций одной строкой (null — скрыть). */
+  readonly counter: string | null;
   readonly prompt: string | null;
 }
 
@@ -85,7 +103,12 @@ export function createHud(container: HTMLElement, i18n: I18n): Hud {
   const stars = el('div', 'tmc-stars');
   stars.id = 'tmc-stars';
   for (let i = 0; i < STAR_SLOTS; i += 1) stars.appendChild(el('span', 'tmc-stars__slot', STAR_EMPTY));
-  left.append(moneyPanel, healthPanel, stars);
+
+  const counter = el('div', 'tmc-panel tmc-counter');
+  counter.id = 'tmc-counter';
+  counter.hidden = true;
+
+  left.append(moneyPanel, healthPanel, stars, counter);
 
   // --- правый верх: мини-карта и спидометр ----------------------------------
   const right = el('div', 'tmc-hud__right');
@@ -97,7 +120,7 @@ export function createHud(container: HTMLElement, i18n: I18n): Hud {
   speedPanel.append(speedValue, speedUnit);
   right.append(minimapHost, speedPanel);
 
-  // --- панель заказа --------------------------------------------------------
+  // --- панель заказа/события ------------------------------------------------
   const missionPanel = el('div', 'tmc-panel tmc-mission');
   missionPanel.id = 'tmc-mission';
   missionPanel.hidden = true;
@@ -111,6 +134,21 @@ export function createHud(container: HTMLElement, i18n: I18n): Hud {
   const missionDistance = el('span', 'tmc-mission__distance', '');
   missionFoot.append(missionTimer, missionDistance);
   missionPanel.append(missionHead, missionObjective, missionFoot);
+
+  const activityBlock = el('div', 'tmc-activity');
+  activityBlock.hidden = true;
+  const activityHead = el('div', 'tmc-mission__head tmc-activity__head');
+  const activityTag = el('span', 'tmc-mission__tag tmc-activity__tag', '');
+  const activityTitle = el('span', 'tmc-mission__title', '');
+  activityHead.append(activityTag, activityTitle);
+  const activityObjective = el('div', 'tmc-mission__objective', '');
+  const activityFoot = el('div', 'tmc-mission__foot');
+  const activityTimer = el('span', 'tmc-mission__timer', '');
+  const activityProgress = el('span', 'tmc-mission__distance', '');
+  const activityDistance = el('span', 'tmc-mission__distance', '');
+  activityFoot.append(activityTimer, activityProgress, activityDistance);
+  activityBlock.append(activityHead, activityObjective, activityFoot);
+  missionPanel.appendChild(activityBlock);
 
   // --- оружие и подсказка ---------------------------------------------------
   const weaponPanel = el('div', 'tmc-panel tmc-weapon');
@@ -139,6 +177,15 @@ export function createHud(container: HTMLElement, i18n: I18n): Hud {
   let lastUrgent = false;
   let lastPrompt = '';
   let lastWeaponLabel = '';
+  let lastActivityKind = '';
+  let lastActivityTag = '';
+  let lastActivityTitle = '';
+  let lastActivityObjective = '';
+  let lastActivityTimer = '';
+  let lastActivityProgress = '';
+  let lastActivityDistance = '';
+  let lastActivityUrgent = false;
+  let lastCounter = '';
 
   const paintStars = (level: number): void => {
     const clamped = Math.max(0, Math.min(STAR_SLOTS, Math.round(level)));
@@ -197,8 +244,16 @@ export function createHud(container: HTMLElement, i18n: I18n): Hud {
         weaponAmmo.classList.toggle('tmc-weapon__ammo--empty', !reloading && state.weapon.mag === 0);
       }
 
+      const counterText = state.counter ?? '';
+      if (counterText !== lastCounter) {
+        lastCounter = counterText;
+        counter.textContent = counterText;
+        counter.hidden = counterText.length === 0;
+      }
+
       const mission = state.mission;
-      missionPanel.hidden = mission === null;
+      const activity = state.activity;
+      missionPanel.hidden = mission === null && activity === null;
       if (mission) {
         if (mission.title !== lastMissionTitle) {
           lastMissionTitle = mission.title;
@@ -221,6 +276,55 @@ export function createHud(container: HTMLElement, i18n: I18n): Hud {
         if (mission.urgent !== lastUrgent) {
           lastUrgent = mission.urgent;
           missionTimer.classList.toggle('tmc-mission__timer--urgent', mission.urgent);
+        }
+        missionHead.hidden = false;
+        missionObjective.hidden = false;
+        missionFoot.hidden = false;
+      } else {
+        missionHead.hidden = true;
+        missionObjective.hidden = true;
+        missionFoot.hidden = true;
+      }
+
+      activityBlock.hidden = activity === null;
+      if (activity) {
+        if (activity.kind !== lastActivityKind) {
+          lastActivityKind = activity.kind;
+          activityBlock.dataset.kind = activity.kind;
+        }
+        if (activity.tag !== lastActivityTag) {
+          lastActivityTag = activity.tag;
+          activityTag.textContent = activity.tag;
+        }
+        if (activity.title !== lastActivityTitle) {
+          lastActivityTitle = activity.title;
+          activityTitle.textContent = activity.title;
+        }
+        if (activity.objective !== lastActivityObjective) {
+          lastActivityObjective = activity.objective;
+          activityObjective.textContent = activity.objective;
+        }
+        const timerText = activity.timer ?? '';
+        if (timerText !== lastActivityTimer) {
+          lastActivityTimer = timerText;
+          activityTimer.textContent = timerText;
+          activityTimer.hidden = timerText.length === 0;
+        }
+        const progressText = activity.progress ?? '';
+        if (progressText !== lastActivityProgress) {
+          lastActivityProgress = progressText;
+          activityProgress.textContent = progressText;
+          activityProgress.hidden = progressText.length === 0;
+        }
+        const distanceText = activity.distance ?? '';
+        if (distanceText !== lastActivityDistance) {
+          lastActivityDistance = distanceText;
+          activityDistance.textContent = distanceText;
+          activityDistance.hidden = distanceText.length === 0;
+        }
+        if (activity.urgent !== lastActivityUrgent) {
+          lastActivityUrgent = activity.urgent;
+          activityTimer.classList.toggle('tmc-mission__timer--urgent', activity.urgent);
         }
       }
 
@@ -249,10 +353,16 @@ export function createHud(container: HTMLElement, i18n: I18n): Hud {
       lastTimer = '';
       lastDistance = '';
       lastPrompt = '';
+      lastActivityTag = '';
+      lastActivityTitle = '';
+      lastActivityObjective = '';
+      lastActivityTimer = '';
+      lastActivityProgress = '';
+      lastActivityDistance = '';
+      lastCounter = '';
     },
     dispose(): void {
       root.remove();
     },
   };
 }
-

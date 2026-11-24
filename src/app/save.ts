@@ -13,7 +13,7 @@ import type { LangCode, TouchMode, UiQuality } from '../config/ui';
 import { detectLang } from '../ui/i18n';
 
 /** Текущая версия формата. Растёт при несовместимых изменениях. */
-export const SAVE_VERSION = 1;
+export const SAVE_VERSION = 2;
 const SAVE_KEY = 'tmc.save';
 
 export interface SaveSettings {
@@ -36,11 +36,44 @@ export interface SaveMissionProgress {
   cooldowns: Record<string, number>;
 }
 
+/** Коллекции: индексы пакетов, трамплинов и сданных уникальных машин. */
+export interface SaveCollectibles {
+  packages: number[];
+  ramps: number[];
+  uniqueCars: number[];
+}
+
+/** Достижения: разблокированные id и накопленная статистика. */
+export interface SaveAchievements {
+  unlocked: string[];
+  stats: Record<string, number>;
+}
+
+/** Подработки: счётчики, типы, кулдауны. */
+export interface SaveJobs {
+  completed: number;
+  counts: Record<string, number>;
+  kinds: string[];
+  cooldowns: Record<string, number>;
+}
+
+/** Прогресс M8 (интерес): коллекции, ачивки, подработки, атмосфера. */
+export interface SaveProgress {
+  collectibles: SaveCollectibles;
+  achievements: SaveAchievements;
+  jobs: SaveJobs;
+  /** Время суток 0..1. */
+  dayPhase: number;
+  /** Станция радио: -1 выключено, 0..2. */
+  radioStation: number;
+}
+
 export interface SaveProfile {
   version: number;
   money: number;
   upgrades: Record<string, number>;
   missions: SaveMissionProgress;
+  progress: SaveProgress;
   settings: SaveSettings;
   stats: SaveStats;
   savedAt: number;
@@ -107,6 +140,27 @@ function asNumberRecord(value: unknown): Record<string, number> {
   return out;
 }
 
+/** Индексы коллекций: неотрицательные целые в пределах лимита, без дублей. */
+function asIndexArray(value: unknown, max: number): number[] {
+  if (!Array.isArray(value)) return [];
+  const out: number[] = [];
+  for (const item of value) {
+    if (typeof item !== 'number' || !Number.isFinite(item)) continue;
+    const index = Math.floor(item);
+    if (index < 0 || index >= max || out.includes(index)) continue;
+    out.push(index);
+  }
+  return out;
+}
+
+const DEFAULT_PROGRESS: SaveProgress = {
+  collectibles: { packages: [], ramps: [], uniqueCars: [] },
+  achievements: { unlocked: [], stats: {} },
+  jobs: { completed: 0, counts: {}, kinds: [], cooldowns: {} },
+  dayPhase: 0.3,
+  radioStation: 0,
+};
+
 /** Профиль новой игры. settings подмешиваются из уже известных настроек. */
 export function createDefaultProfile(settings?: Partial<SaveSettings>): SaveProfile {
   return {
@@ -114,6 +168,13 @@ export function createDefaultProfile(settings?: Partial<SaveSettings>): SaveProf
     money: ECONOMY.startMoney,
     upgrades: {},
     missions: { completed: [], cooldowns: {} },
+    progress: {
+      collectibles: { packages: [], ramps: [], uniqueCars: [] },
+      achievements: { unlocked: [], stats: {} },
+      jobs: { completed: 0, counts: {}, kinds: [], cooldowns: {} },
+      dayPhase: DEFAULT_PROGRESS.dayPhase,
+      radioStation: DEFAULT_PROGRESS.radioStation,
+    },
     settings: {
       lang: settings?.lang ?? UI.settings.lang,
       volume: settings?.volume ?? UI.settings.volume,
@@ -147,6 +208,10 @@ export function migrateProfile(raw: unknown): SaveProfile | null {
   const settingsRaw = asRecord(source.settings);
   const statsRaw = asRecord(source.stats);
   const missionsRaw = asRecord(source.missions);
+  const progressRaw = asRecord(source.progress);
+  const collectiblesRaw = asRecord(progressRaw?.collectibles);
+  const achievementsRaw = asRecord(progressRaw?.achievements);
+  const jobsRaw = asRecord(progressRaw?.jobs);
 
   const moneyFallback = typeof source.money === 'number' ? source.money : defaults.money;
 
@@ -157,6 +222,25 @@ export function migrateProfile(raw: unknown): SaveProfile | null {
     missions: {
       completed: asStringArray(missionsRaw?.completed),
       cooldowns: asNumberRecord(missionsRaw?.cooldowns),
+    },
+    progress: {
+      collectibles: {
+        packages: asIndexArray(collectiblesRaw?.packages, 40),
+        ramps: asIndexArray(collectiblesRaw?.ramps, 12),
+        uniqueCars: asIndexArray(collectiblesRaw?.uniqueCars, 8),
+      },
+      achievements: {
+        unlocked: asStringArray(achievementsRaw?.unlocked),
+        stats: asNumberRecord(achievementsRaw?.stats),
+      },
+      jobs: {
+        completed: Math.round(asNumber(jobsRaw?.completed, 0, 0, 1_000_000)),
+        counts: asNumberRecord(jobsRaw?.counts),
+        kinds: asStringArray(jobsRaw?.kinds),
+        cooldowns: asNumberRecord(jobsRaw?.cooldowns),
+      },
+      dayPhase: asNumber(progressRaw?.dayPhase, DEFAULT_PROGRESS.dayPhase, 0, 1),
+      radioStation: Math.round(asNumber(progressRaw?.radioStation, DEFAULT_PROGRESS.radioStation, -1, 2)),
     },
     settings: {
       lang: asLang(settingsRaw?.lang, defaults.settings.lang),

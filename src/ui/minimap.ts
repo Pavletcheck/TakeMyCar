@@ -49,7 +49,7 @@ export interface MinimapSource {
   readonly water: readonly MinimapRect[];
 }
 
-export type MinimapMarkerKind = 'start' | 'target' | 'checkpoint' | 'garage';
+export type MinimapMarkerKind = 'start' | 'target' | 'checkpoint' | 'garage' | 'event' | 'job' | 'collect';
 
 export interface MinimapMarker {
   readonly x: number;
@@ -63,6 +63,8 @@ export interface MinimapFrame {
   readonly playerHeading: number;
   readonly cops: readonly { readonly x: number; readonly z: number }[];
   readonly markers: readonly MinimapMarker[];
+  /** Пары x,z,тип (0 — пакет, 1 — уникальная машина) в радиусе обзора. */
+  readonly loot?: readonly number[];
 }
 
 export interface Minimap {
@@ -99,6 +101,15 @@ export function createMinimap(host: HTMLElement, source: MinimapSource, config: 
 
   const colors = config.colors;
   const range = config.layout.minimapRange;
+  const markerColors: Readonly<Record<MinimapMarkerKind, string>> = {
+    start: colors.accent,
+    target: colors.mission,
+    checkpoint: colors.mission,
+    garage: colors.accent,
+    event: '#ffa94d',
+    job: '#63e6be',
+    collect: '#ffd43b',
+  };
   let cssSize = 0;
   let dpr = 1;
 
@@ -200,7 +211,21 @@ export function createMinimap(host: HTMLElement, source: MinimapSource, config: 
       ctx.fill();
     }
 
-    // Маркеры заказа: ромб в кадре, стрелка у края, если цель далеко.
+    // Коллекции: точки пакетов и уникальных машин в радиусе обзора.
+    const loot = frame.loot;
+    if (loot && loot.length > 0) {
+      for (let i = 0; i + 2 < loot.length; i += 3) {
+        const lx = toX(loot[i]);
+        const ly = toY(loot[i + 1]);
+        if (lx < -pad || ly < -pad || lx > size + pad || ly > size + pad) continue;
+        ctx.fillStyle = loot[i + 2] === 1 ? '#63e6be' : '#ffd43b';
+        ctx.beginPath();
+        ctx.arc(lx, ly, loot[i + 2] === 1 ? 2.4 : 1.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Маркеры заказа/события/подработки: ромб в кадре, стрелка у края.
     const pulse = 0.65 + Math.sin(performance.now() / 220) * 0.35;
     for (let i = 0; i < frame.markers.length; i += 1) {
       const marker = frame.markers[i];
@@ -208,7 +233,7 @@ export function createMinimap(host: HTMLElement, source: MinimapSource, config: 
       let dy = (marker.z - pz) * scale;
       const limit = half - EDGE_MARGIN;
       const outside = Math.abs(dx) > limit || Math.abs(dy) > limit;
-      const color = marker.kind === 'garage' ? colors.accent : colors.mission;
+      const color = markerColors[marker.kind] ?? colors.mission;
       if (outside) {
         const factor = limit / Math.max(Math.abs(dx), Math.abs(dy));
         dx *= factor;

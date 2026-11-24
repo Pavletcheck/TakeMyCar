@@ -10,7 +10,7 @@ import type { UiConfig, UiQuality, TouchMode } from '../config/ui';
 import type { I18n, Lang } from './i18n';
 
 export type MenuScreen = 'none' | 'start' | 'pause';
-export type PauseTab = 'main' | 'settings' | 'shop';
+export type PauseTab = 'main' | 'settings' | 'shop' | 'progress';
 export type SoundKind = 'click' | 'success' | 'error';
 
 export interface MenuUpgradeView {
@@ -47,6 +47,42 @@ export interface MenuStatsView {
   readonly playTime: string;
 }
 
+export interface MenuAchievementView {
+  readonly id: string;
+  readonly title: string;
+  readonly desc: string;
+  readonly glyph: string;
+  readonly unlocked: boolean;
+  readonly progress: number;
+  readonly target: number;
+  readonly reward: string;
+}
+
+export interface MenuUniqueCarView {
+  readonly name: string;
+  readonly delivered: boolean;
+}
+
+export interface MenuJobProgressView {
+  readonly name: string;
+  readonly count: number;
+}
+
+/** Экран прогресса: достижения, коллекции и статистика. */
+export interface MenuProgressView {
+  readonly achievements: readonly MenuAchievementView[];
+  readonly found: number;
+  readonly total: number;
+  readonly packages: { readonly found: number; readonly total: number };
+  readonly ramps: { readonly found: number; readonly total: number };
+  readonly cars: { readonly found: number; readonly total: number };
+  readonly uniqueCars: readonly MenuUniqueCarView[];
+  readonly jobs: readonly MenuJobProgressView[];
+  readonly rows: readonly string[];
+  readonly radio: string;
+  readonly time: string;
+}
+
 export interface MenuSettingsView {
   readonly lang: Lang;
   readonly volume: number;
@@ -61,6 +97,7 @@ export interface MenuState {
   readonly settings: MenuSettingsView;
   readonly stats: MenuStatsView;
   readonly shop: MenuShopView;
+  readonly progress: MenuProgressView;
 }
 
 export interface MenuCallbacks {
@@ -412,6 +449,79 @@ export function createMenu(container: HTMLElement, i18n: I18n, config: UiConfig,
     );
   };
 
+  const renderProgress = (state: MenuState): void => {
+    body.textContent = '';
+    const progress = state.progress;
+
+    const head = el('div', 'tmc-progress__head');
+    const counter = el(
+      'div',
+      'tmc-progress__counter',
+      i18n.t('achievement.counter', { found: progress.found, total: progress.total }),
+    );
+    const meta = el('div', 'tmc-progress__meta', `${progress.time} · ${progress.radio}`);
+    head.append(counter, meta);
+    body.appendChild(head);
+
+    const rows = el('div', 'tmc-stats tmc-progress__rows');
+    for (const row of progress.rows) rows.appendChild(el('div', 'tmc-stats__row', row));
+    body.appendChild(rows);
+
+    body.appendChild(el('div', 'tmc-progress__section', i18n.t('progress.achievements')));
+    const grid = el('div', 'tmc-ach-grid');
+    for (const achievement of progress.achievements) {
+      const card = el('div', achievement.unlocked ? 'tmc-ach tmc-ach--on' : 'tmc-ach');
+      const cardHead = el('div', 'tmc-ach__head');
+      cardHead.append(
+        el('span', 'tmc-ach__glyph', achievement.unlocked ? achievement.glyph : '·'),
+        el('span', 'tmc-ach__title', achievement.title),
+        el('span', 'tmc-ach__reward', achievement.reward),
+      );
+      const desc = el('div', 'tmc-ach__desc', achievement.desc);
+      const bar = el('div', 'tmc-ach__bar');
+      const fill = el('div', 'tmc-ach__fill');
+      const ratio = achievement.target > 0 ? Math.min(1, achievement.progress / achievement.target) : 0;
+      fill.style.width = `${(ratio * 100).toFixed(0)}%`;
+      bar.appendChild(fill);
+      card.append(cardHead, desc, bar);
+      grid.appendChild(card);
+    }
+    body.appendChild(grid);
+
+    body.appendChild(el('div', 'tmc-progress__section', i18n.t('progress.collectibles')));
+    const collect = el('div', 'tmc-progress__collect');
+    collect.append(
+      el('div', 'tmc-progress__pill', i18n.t('progress.packages', progress.packages)),
+      el('div', 'tmc-progress__pill', i18n.t('progress.ramps', progress.ramps)),
+      el('div', 'tmc-progress__pill', i18n.t('progress.cars', progress.cars)),
+    );
+    body.appendChild(collect);
+
+    body.appendChild(el('div', 'tmc-progress__section', i18n.t('progress.unique')));
+    const cars = el('div', 'tmc-progress__list');
+    for (const car of progress.uniqueCars) {
+      const row = el('div', car.delivered ? 'tmc-progress__item tmc-progress__item--on' : 'tmc-progress__item');
+      row.append(el('span', 'tmc-progress__item-name', car.name), el('span', 'tmc-progress__item-value', car.delivered ? '\u2713' : '\u2014'));
+      cars.appendChild(row);
+    }
+    body.appendChild(cars);
+
+    body.appendChild(el('div', 'tmc-progress__section', i18n.t('progress.jobs')));
+    const jobList = el('div', 'tmc-progress__list');
+    for (const job of progress.jobs) {
+      const row = el('div', 'tmc-progress__item');
+      row.append(el('span', 'tmc-progress__item-name', job.name), el('span', 'tmc-progress__item-value', String(job.count)));
+      jobList.appendChild(row);
+    }
+    body.appendChild(jobList);
+
+    body.appendChild(
+      button(i18n.t('common.back'), 'tmc-button tmc-button--ghost', () => act(() => {
+        tab = 'main';
+      })),
+    );
+  };
+
   const renderTabs = (): void => {
     tabs.textContent = '';
     if (screen !== 'pause') {
@@ -422,6 +532,7 @@ export function createMenu(container: HTMLElement, i18n: I18n, config: UiConfig,
     const items: readonly { readonly id: PauseTab; readonly label: string }[] = [
       { id: 'main', label: i18n.t('menu.main') },
       { id: 'shop', label: i18n.t('menu.shop') },
+      { id: 'progress', label: i18n.t('menu.progress') },
       { id: 'settings', label: i18n.t('menu.settings') },
     ];
     for (const item of items) {
@@ -451,6 +562,7 @@ export function createMenu(container: HTMLElement, i18n: I18n, config: UiConfig,
     if (screen === 'start') renderStart(state);
     else if (tab === 'settings') renderSettings(state);
     else if (tab === 'shop') renderShop(state);
+    else if (tab === 'progress') renderProgress(state);
     else renderMain(state);
 
     message.textContent = messageText;

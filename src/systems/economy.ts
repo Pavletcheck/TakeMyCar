@@ -18,7 +18,11 @@ export type EconomyReason =
   | 'ammo'
   | 'upgrade'
   | 'debug'
-  | 'reset';
+  | 'reset'
+  | 'event'
+  | 'job'
+  | 'collect'
+  | 'achievement';
 
 export interface EconomyChange {
   readonly total: number;

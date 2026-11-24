@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { createGameAudio } from '../audio/audio';
+import { createRadio } from '../audio/radio';
 import { FollowCamera } from '../core/camera';
 import { resolveRectBody } from '../core/collision';
 import { attachKeyboard, createInputState, InputMap } from '../core/input';
@@ -12,11 +13,14 @@ import { createRng } from '../core/rng';
 import { SpatialHash } from '../core/spatialHash';
 import { createCityView } from '../render/cityView';
 import { createEffectsView } from '../render/effectsView';
+import { createLifePropsView } from '../render/lifePropsView';
+import { createNightView } from '../render/nightView';
 import { createNpcView } from '../render/npcView';
 import { createPlayerView } from '../render/playerView';
 import { createVehicleView } from '../render/vehicleView';
 import { TUNING } from '../config/tuning';
 import { WORLD } from '../config/world';
+import type { DistrictId } from '../config/world';
 import { VEHICLE_TYPES, isVehicleType, vehicleColliderRadius } from '../config/vehicles';
 import { PLAYER } from '../config/player';
 import { WANTED, WEAPON_ORDER } from '../config/life';
@@ -25,6 +29,10 @@ import { ECONOMY } from '../config/economy';
 import type { UpgradeId } from '../config/economy';
 import { MISSIONS, findMission } from '../config/missions';
 import type { MissionDef } from '../config/missions';
+import { DAY_NIGHT, RADIO_STATIONS } from '../config/ambience';
+import { buildPackageLayout, RAMPS, UNIQUE_CAR_ANCHORS } from '../config/collectibles';
+import type { CollectibleBlock } from '../config/collectibles';
+import { JOBS, findJobDef } from '../config/jobs';
 import { UI } from '../config/ui';
 import type { LangCode, TouchMode, UiQuality } from '../config/ui';
 import {
@@ -46,10 +54,18 @@ import { WantedSystem } from '../systems/wanted';
 import { EconomySystem } from '../systems/economy';
 import { MissionSystem } from '../systems/missions';
 import type { MissionHudState } from '../systems/missions';
+import { EventDirector } from '../systems/eventDirector';
+import type { EventSpawnPoint } from '../systems/eventDirector';
+import { JobsSystem } from '../systems/jobs';
+import type { JobHudState, JobSpawnRequest } from '../systems/jobs';
+import { CollectiblesSystem } from '../systems/collectibles';
+import type { CollectEvent } from '../systems/collectibles';
+import { AchievementSystem } from '../systems/achievements';
+import { DayNightCycle } from '../systems/dayNight';
 import { createSaveService, SAVE_VERSION } from './save';
 import type { SaveProfile, SaveSettings } from './save';
 import { createHud } from '../ui/hud';
-import type { HudMission } from '../ui/hud';
+import type { HudActivity, HudMission } from '../ui/hud';
 import { createI18n, detectLang } from '../ui/i18n';
 import { createMenu } from '../ui/menu';
 import type { MenuState, SoundKind } from '../ui/menu';
@@ -57,7 +73,7 @@ import { createMinimap } from '../ui/minimap';
 import type { MinimapMarker } from '../ui/minimap';
 import { createMobileControls } from '../ui/mobile';
 import { createPager } from '../ui/pager';
-import type { PagerEntry } from '../ui/pager';
+import type { PagerEntry, PagerTab } from '../ui/pager';
 import { applyTheme } from '../ui/theme';
 import { createToast } from '../ui/toast';
 import { DEFAULT_MAP_ID, loadCityMap } from '../world/mapLoader';
@@ -271,6 +287,30 @@ interface TmcDebugApi {
   shop(): Record<string, number | string>;
   /** M6: снимок интерфейса: HUD, меню, пейджер, мобилка, мини-карта. */
   uiState(): Record<string, number | string>;
+  /** M8: активные события города. */
+  events(): Record<string, number | string>[];
+  /** M8: принудительный старт события по id (опционально с координатами). */
+  forceEvent(id: string, x?: number, z?: number): number;
+  /** M8: отменить все события. */
+  cancelEvent(): number;
+  /** M8: снимок подработки. */
+  jobs(): Record<string, number | string>;
+  /** M8: список подработок со статусами. */
+  jobList(): Record<string, number | string>[];
+  /** M8: взять подработку по id; 1 — взяли. */
+  startJob(id: string): number;
+  /** M8: коллекции (пакеты/трамплины/машины) и ближайший пакет. */
+  collectibles(): Record<string, number | string>;
+  /** M8: псевдоним collections() из QA-плана. */
+  collections(): Record<string, number | string>;
+  /** M8: достижения и статистика. */
+  achievements(): Record<string, number | string>[];
+  /** M8: радио (станция, новости). */
+  radio(): Record<string, number | string>;
+  /** M8: суточный цикл. */
+  dayNight(): Record<string, number | string>;
+  /** M8: сводка интереса (для C-10). */
+  interest(): Record<string, number | string>;
 }
 
 declare global {
@@ -547,6 +587,61 @@ export function bootstrap(): void {
 
   spawnCityVehicles();
 
+  // --- M8: точки сцен ------------------------------------------------------
+  // Событие ставится на проезжей части (полоса графа) или на тротуаре
+  // (углы плит кварталов). Район нужен для веса сцен по районам.
+  const eventSpawnPoints: EventSpawnPoint[] = [];
+  {
+    const districts = world.map.districts;
+    const districtAt = (x: number, z: number): DistrictId => {
+      for (let i = 0; i < districts.length; i += 1) {
+        const area = districts[i].bounds;
+        if (
+          x >= area.x - area.hx &&
+          x <= area.x + area.hx &&
+          z >= area.z - area.hz &&
+          z <= area.z + area.hz
+        ) {
+          return districts[i].id;
+        }
+      }
+      return 'center';
+    };
+    const carPoints = world.roadGraph.spawnPoints;
+    for (let i = 0; i < carPoints.length; i += 1) {
+      const point = carPoints[i];
+      if (point.tag !== 'car') continue;
+      eventSpawnPoints.push({
+        x: point.x,
+        z: point.z,
+        heading: point.heading,
+        kind: 'road',
+        district: districtAt(point.x, point.z),
+      });
+    }
+    const blocks = world.map.blocks;
+    for (let i = 0; i < blocks.length; i += 1) {
+      const rect = blocks[i].rect;
+      const dx = Math.max(1.5, rect.hx - 2.6);
+      const dz = Math.max(1.5, rect.hz - 2.6);
+      const corners: readonly (readonly [number, number])[] = [
+        [rect.x - dx, rect.z - dz],
+        [rect.x + dx, rect.z - dz],
+        [rect.x + dx, rect.z + dz],
+        [rect.x - dx, rect.z + dz],
+      ];
+      for (let k = 0; k < corners.length; k += 1) {
+        eventSpawnPoints.push({
+          x: corners[k][0],
+          z: corners[k][1],
+          heading: 0,
+          kind: 'sidewalk',
+          district: districtAt(corners[k][0], corners[k][1]),
+        });
+      }
+    }
+  }
+
   // --- стресс-режим ?stress=1 ----------------------------------------------
   const movers: MoverSpec[] = [];
   let stressTime = 0;
@@ -782,9 +877,11 @@ export function bootstrap(): void {
   combat.onImpact = (x, z, hit) => effectsView.impact(x, z, hit);
   traffic.onHonk = (x, z) => peds.alertAt(x, z, 16, 'alert');
   wanted.onLevelChanged = (level) => {
+    maxWantedStars = Math.max(maxWantedStars, level);
     if (level > 0) {
       toast.show(i18n.t('toast.starsUp', { level }), 'error', 2.4);
       playSound('error');
+      radio.news(i18n.t('radio.news.crime', { level }));
     } else {
       toast.show(i18n.t('toast.starsClear'), 'success', 2.4);
     }
@@ -857,6 +954,7 @@ export function bootstrap(): void {
         4,
       );
       audio.mission('complete');
+      radio.news(i18n.t('radio.news.mission', { title: i18n.t(def.titleKey) }));
       releaseMissionCar();
       saveGame(true);
     },
@@ -902,9 +1000,300 @@ export function bootstrap(): void {
     missionCar = null;
   }
 
+  // --- M8: интерес — события, подработки, коллекции, достижения, атмосфера --
+  const dayNight = new DayNightCycle(
+    savedProfile ? savedProfile.progress.dayPhase : DAY_NIGHT.startPhase,
+  );
+  const radio = createRadio({
+    onNews: (text) => {
+      toast.show(text, 'info', 3.2);
+    },
+  });
+  radio.setVolume(uiSettings.volume);
+  radio.setMuted(uiSettings.muted);
+  if (savedProfile) radio.setStation(savedProfile.progress.radioStation);
+
+  const nightView = createNightView(scene, FLEET_VISUAL_LIMIT);
+
+  const collectibleBlocks: CollectibleBlock[] = world.map.blocks.map((block) => ({
+    x: block.rect.x,
+    z: block.rect.z,
+    hx: block.rect.hx,
+    hz: block.rect.hz,
+    kind: block.kind,
+  }));
+  const packagePoints = buildPackageLayout(collectibleBlocks);
+  const lifePropsView = createLifePropsView(scene, packagePoints, RAMPS);
+
+  let maxWantedStars = 0;
+  let totalWrecks = 0;
+
+  const achievements = new AchievementSystem({
+    unlocked: savedProfile ? savedProfile.progress.achievements.unlocked : undefined,
+    stats: savedProfile ? savedProfile.progress.achievements.stats : undefined,
+    onUnlock: (def, reward) => {
+      economy.add(reward, 'achievement');
+      toast.show(
+        i18n.t('achievement.unlocked', {
+          title: i18n.t(def.titleKey),
+          reward: `${i18n.t('hud.currency')}${i18n.formatNumber(reward)}`,
+        }),
+        'success',
+        3.6,
+      );
+      audio.ui('success');
+    },
+  });
+  maxWantedStars = achievements.stats.maxStars;
+
+  const collectibles = new CollectiblesSystem({
+    packages: packagePoints,
+    ramps: RAMPS,
+    carNames: UNIQUE_CAR_ANCHORS.map((anchor) => anchor.nameKey),
+    garage: { x: ECONOMY.garage[0], z: ECONOMY.garage[1] },
+    garageRadius: ECONOMY.garageRadius,
+    onCollect: (event: CollectEvent) => {
+      economy.add(event.reward, 'collect');
+      const rewardText = `${i18n.t('hud.currency')}${i18n.formatNumber(event.reward)}`;
+      let text = '';
+      if (event.kind === 'package') {
+        text = i18n.t(
+          event.milestone ? 'collectible.package.milestone' : 'collectible.package',
+          { found: event.found, total: event.total, reward: rewardText },
+        );
+      } else if (event.kind === 'ramp') {
+        text = i18n.t(
+          event.milestone ? 'collectible.ramp.milestone' : 'collectible.ramp',
+          { found: event.found, total: event.total, reward: rewardText },
+        );
+      } else {
+        const name = event.nameKey ? i18n.t(event.nameKey) : '';
+        text = i18n.t(
+          event.milestone ? 'collectible.car.milestone' : 'collectible.car',
+          { name, found: event.found, total: event.total, reward: rewardText },
+        );
+        const slot = collectibles.uniqueCars[event.index];
+        if (slot) slot.vehicleId = -1;
+      }
+      toast.show(text, 'success', 2.6);
+      audio.ui('success');
+    },
+  });
+  if (savedProfile) collectibles.restore(savedProfile.progress.collectibles);
+
+  const events = new EventDirector({
+    fleet,
+    registry,
+    physics,
+    graph: world.roadGraph,
+    spawnPoints: eventSpawnPoints,
+    playerId: player.id,
+    seed: world.seed ^ 0xefec7,
+    onStart: (def, x, z) => {
+      maxWantedStars = Math.max(maxWantedStars, wanted.level);
+      toast.show(
+        i18n.t('event.started', { title: i18n.t(def.titleKey) }),
+        'info',
+        2.8,
+      );
+      radio.news(i18n.t(def.newsKey));
+      audio.ui('click');
+      if (def.id === 'robbery' || def.id === 'shootout') peds.alertAt(x, z, 18, 'flee');
+    },
+    onEnd: (def, resolved) => {
+      if (resolved) {
+        toast.show(
+          i18n.t('event.resolved', {
+            title: i18n.t(def.titleKey),
+            reward: `${i18n.t('hud.currency')}${i18n.formatNumber(def.reward)}`,
+          }),
+          'success',
+          3.4,
+        );
+      } else {
+        toast.show(
+          i18n.t('event.failed', { title: i18n.t(def.titleKey) }),
+          'error',
+          3,
+        );
+      }
+      radio.news(
+        i18n.t(resolved ? 'event.news.resolved' : 'event.news.failed', {
+          title: i18n.t(def.titleKey),
+        }),
+      );
+    },
+    onReward: (_def, amount) => {
+      economy.add(amount, 'event');
+    },
+    onHeat: (level) => {
+      // EVT-06: сцена сама не поднимает розыск выше 3.
+      wanted.setLevel(Math.max(wanted.level, Math.min(3, level)));
+    },
+  });
+
+  const jobSpotScratch: SpawnPoint[] = [];
+  /**
+   * Свободная точка дороги рядом с игроком для машины подработки.
+   * Проверка коллайдеров — placementFree (R-13).
+   */
+  function findJobSpot(
+    minDistance: number,
+    maxDistance: number,
+    radius: number,
+  ): { x: number; z: number; heading: number } | null {
+    const position = playerWorldPosition();
+    world.querySpawnPoints(position.x, position.z, maxDistance + 10, 'car', jobSpotScratch);
+    let best: SpawnPoint | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < jobSpotScratch.length; i += 1) {
+      const point = jobSpotScratch[i];
+      const dx = point.x - position.x;
+      const dz = point.z - position.z;
+      const distance = Math.hypot(dx, dz);
+      if (distance < minDistance || distance > maxDistance) continue;
+      if (!placementFree(point.x, point.z, radius)) continue;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = point;
+      }
+    }
+    return best ? { x: best.x, z: best.z, heading: best.heading } : null;
+  }
+
+  const jobs = new JobsSystem({
+    fleet,
+    registry,
+    physics,
+    playerId: player.id,
+    seed: world.seed ^ 0x1a8f,
+    findSpot: (minDistance, maxDistance, radius) => findJobSpot(minDistance, maxDistance, radius),
+    onSpawnVehicle: (request: JobSpawnRequest) =>
+      createVehicle(fleet, registry, {
+        type: request.type,
+        x: request.x,
+        z: request.z,
+        heading: request.heading,
+        colorIndex: request.colorIndex,
+      }),
+    onStart: (def) => {
+      toast.show(i18n.t(def.titleKey), 'info', 2.4);
+      audio.mission('start');
+      radio.news(i18n.t('job.news.start', { title: i18n.t(def.titleKey) }));
+    },
+    onStage: () => {
+      audio.mission('pickup');
+      toast.show(i18n.t('mission.stageChanged'), 'info', 1.6);
+    },
+    onComplete: (def, reward, tip) => {
+      economy.add(reward, 'job');
+      const money = `${i18n.t('hud.currency')}${i18n.formatNumber(reward)}`;
+      let text = i18n.t('job.completed', { title: i18n.t(def.titleKey), reward: money });
+      if (tip > 0) {
+        text += ` · ${i18n.t('job.tip', {
+          tip: `${i18n.t('hud.currency')}${i18n.formatNumber(tip)}`,
+        })}`;
+      }
+      toast.show(text, 'success', 3.6);
+      audio.mission('complete');
+      syncAchievements();
+    },
+    onFail: (def, reason) => {
+      if (def.heatOnFail > 0) {
+        wanted.setLevel(Math.max(wanted.level, Math.min(3, def.heatOnFail)));
+      }
+      toast.show(i18n.t(`job.failed.${reason}`), 'error', 3.2);
+      audio.mission('fail');
+      syncAchievements();
+    },
+    onWreck: (_def, done, total) => {
+      if (done % 2 !== 0 && done < total) return;
+      toast.show(i18n.t('job.objective.rampage', { done, total }), 'info', 1.4);
+      audio.ui('click');
+    },
+    onNews: (kind, def) => {
+      radio.news(
+        i18n.t(`job.news.${kind}`, { title: i18n.t(def.titleKey) }),
+      );
+    },
+  });
+  if (savedProfile) jobs.restore(savedProfile.progress.jobs);
+
+  /** Синхронизация статистики достижений — раз в HUD-тик, не в кадре. */
+  function syncAchievements(): void {
+    achievements.setStat('packages', collectibles.packagesFound);
+    achievements.setStat('ramps', collectibles.rampsFound);
+    achievements.setStat('uniqueCars', collectibles.carsFound);
+    achievements.setStat('jobs', jobs.stats.completed);
+    achievements.setStat('jobKinds', jobs.kindsCompleted);
+    achievements.setStat('events', events.stats.resolved);
+    achievements.setStat('maxStars', maxWantedStars);
+    achievements.setStat('missions', statsState.missionsCompleted);
+    achievements.setStat('earned', economy.earned);
+    achievements.setStat('wrecks', totalWrecks);
+    achievements.setStat('raceWins', jobs.completedCount('race'));
+    achievements.sync();
+  }
+
+  /** Уникальные машины: спавн рядом с якорем на свободной точке дороги. */
+  const uniqueCarScratch: SpawnPoint[] = [];
+  function spawnUniqueCars(): void {
+    for (let i = 0; i < UNIQUE_CAR_ANCHORS.length; i += 1) {
+      if (collectibles.isCarDelivered(i)) continue;
+      const anchor = UNIQUE_CAR_ANCHORS[i];
+      world.querySpawnPoints(anchor.x, anchor.z, 160, 'car', uniqueCarScratch);
+      let best: SpawnPoint | null = null;
+      let bestDistance = Number.POSITIVE_INFINITY;
+      for (let k = 0; k < uniqueCarScratch.length; k += 1) {
+        const point = uniqueCarScratch[k];
+        if (!placementFree(point.x, point.z, 3.2)) continue;
+        const distance = Math.hypot(point.x - anchor.x, point.z - anchor.z);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = point;
+        }
+      }
+      let x = anchor.x;
+      let z = anchor.z;
+      let heading = 0;
+      if (best) {
+        x = best.x;
+        z = best.z;
+        heading = best.heading;
+      } else if (!placementFree(anchor.x, anchor.z, 3.2)) {
+        continue;
+      }
+      const vehicle = createVehicle(fleet, registry, {
+        type: anchor.type,
+        x,
+        z,
+        heading,
+        colorIndex: anchor.colorIndex,
+      });
+      collectibles.registerCar(i, vehicle.id, x, z);
+    }
+  }
+
+  /** Снять машины коллекции с карты (загрузка/сброс) и заспавнить заново. */
+  function clearUniqueCars(): void {
+    for (let i = 0; i < collectibles.uniqueCars.length; i += 1) {
+      const slot = collectibles.uniqueCars[i];
+      if (slot.vehicleId < 0) continue;
+      const vehicle = fleet.get(slot.vehicleId);
+      if (vehicle && vehicle.driver < 0) destroyVehicle(fleet, registry, vehicle);
+      slot.vehicleId = -1;
+    }
+  }
+
+  function respawnUniqueCars(): void {
+    clearUniqueCars();
+    spawnUniqueCars();
+  }
+
   // Стартовое население: только за пределами безопасной зоны.
   traffic.prefill(TRAFFIC_PREFILL, spawn.x, spawn.z);
   peds.prefill(PEDS_PREFILL, spawn.x, spawn.z);
+  spawnUniqueCars();
 
   /** Переиспользуемый снимок игрока: без аллокаций в фиксированном шаге. */
   const playerSnapshot = {
@@ -927,7 +1316,20 @@ export function bootstrap(): void {
     vehicleWrecked: false,
     vehicleId: -1,
   };
+  /** Снимок игрока для событий, подработок и коллекций. */
+  const lifePlayer = {
+    x: spawn.x,
+    z: spawn.z,
+    speed: 0,
+    inVehicle: false,
+    vehicleId: -1,
+    vehicleType: null as VehicleTypeId | null,
+  };
   let gameTime = 0;
+  /** Уничтоженные машины за шаг: уведомления после обхода флота (M8). */
+  const wreckIds: EntityId[] = [];
+  const wreckXs: number[] = [];
+  const wreckZs: number[] = [];
   let fireHeld = false;
   let firePressed = false;
   let stealTimer = 0;
@@ -978,6 +1380,7 @@ export function bootstrap(): void {
     if (event.button !== 0) return;
     // Клик по HUD/меню не должен стрелять: огонь только по игровому полотну.
     if (!(event.target instanceof HTMLCanvasElement)) return;
+    if (uiPaused()) return;
     updatePointer(event);
     fireHeld = true;
     firePressed = true;
@@ -1097,7 +1500,8 @@ export function bootstrap(): void {
         const index = Number(event.code.slice(5));
         if (index >= 1 && index <= 9) {
           event.preventDefault();
-          startMissionByIndex(index);
+          if (pager.activeTab === 'jobs') startJobByIndex(index);
+          else startMissionByIndex(index);
         }
         return;
       }
@@ -1110,6 +1514,13 @@ export function bootstrap(): void {
     if (event.code === 'KeyM') {
       event.preventDefault();
       togglePager();
+      return;
+    }
+    // R-05: пока интерфейс на паузе, игровые действия не принимаем.
+    if (uiPaused()) return;
+    if (event.code === 'KeyB') {
+      event.preventDefault();
+      cycleRadio();
       return;
     }
     if (event.code === 'KeyE') {
@@ -1131,6 +1542,7 @@ export function bootstrap(): void {
   // Первый жест разблокирует WebAudio (политика автозапуска браузеров).
   const unlockAudio = (): void => {
     audio.resume();
+    radio.resume();
     window.removeEventListener('pointerdown', unlockAudio);
     window.removeEventListener('keydown', unlockAudio);
   };
@@ -1209,6 +1621,8 @@ export function bootstrap(): void {
 
   // --- M6: пауза, интерфейс, магазин, сохранение ---------------------------
   const missionMarkerView = createMissionMarkerView(scene);
+  const activityMarkerView = createMissionMarkerView(scene);
+  let ambienceTimer = 0;
   let pauseBlur = false;
   let pauseMenu = false;
   let pausePager = false;
@@ -1220,6 +1634,22 @@ export function bootstrap(): void {
     const vehicle = playerController.mode === 'driving' ? playerController.vehicle : null;
     if (vehicle) return { x: vehicle.transform.x, z: vehicle.transform.z };
     return { x: playerTransform.x, z: playerTransform.z };
+  }
+
+  /**
+   * Цвета суток применяются к уже существующим hemi/sun/fog/background
+   * (R-19): сцена не пересоздаётся, тени и качество не трогаем.
+   */
+  function applyAmbience(): void {
+    const sample = dayNight.state;
+    if (scene.background instanceof THREE.Color) scene.background.setHex(sample.sky);
+    if (scene.fog instanceof THREE.Fog) scene.fog.color.setHex(sample.fog);
+    hemi.color.setHex(sample.hemiSky);
+    hemi.groundColor.setHex(sample.hemiGround);
+    hemi.intensity = sample.hemiIntensity;
+    sun.color.setHex(sample.sun);
+    sun.intensity = sample.sunIntensity;
+    renderer.toneMappingExposure = sample.exposure;
   }
 
   function garageDistance(): number {
@@ -1243,9 +1673,36 @@ export function bootstrap(): void {
    * Пауза — набор причин: blur, меню, пейджер и стартовый экран.
    * Снимается только снятием последней причины (как в контракте GameLoop).
    */
+  function uiPaused(): boolean {
+    return pauseBlur || pauseMenu || pausePager || pauseStart;
+  }
+
+  function clearActionInput(): void {
+    fireHeld = false;
+    firePressed = false;
+    interactRequested = false;
+    hornRequested = false;
+    reloadRequested = false;
+    weaponRequest = -1;
+  }
+
+  /** B — переключение радио: 0 → 1 → 2 → выкл (Digit* занят пейджером). */
+  function cycleRadio(): void {
+    radio.resume();
+    const index = radio.next();
+    audio.ui('click');
+    const stationKey = index < 0 ? 'radio.station.off' : RADIO_STATIONS[index].nameKey;
+    toast.show(
+      i18n.t('radio.stationChanged', { station: i18n.t(stationKey) }),
+      'info',
+      2,
+    );
+  }
+
   function applyPauseState(): void {
     const paused = pauseBlur || pauseMenu || pausePager || pauseStart;
     if (paused) {
+      clearActionInput();
       loop.pause();
       input.clear();
       mobile.releaseAll();
@@ -1287,9 +1744,14 @@ export function bootstrap(): void {
       pager.close();
       return;
     }
-    const entries = buildPagerEntries();
-    if (pager.isOpen) pager.refresh(entries);
-    else pager.open(entries, (id) => startMissionById(id));
+    const tabs = buildPagerTabs();
+    const activeTab = pager.activeTab === 'jobs' ? 'jobs' : 'missions';
+    const onAccept = (id: string): void => {
+      if (findJobDef(id)) startJobById(id);
+      else startMissionById(id);
+    };
+    if (pager.isOpen) pager.refresh(tabs, activeTab);
+    else pager.open(tabs, onAccept, activeTab);
   }
 
   function openPagerPanel(): void {
@@ -1333,9 +1795,28 @@ export function bootstrap(): void {
     if (entry && entry.status === 'available') startMissionById(entry.def.id);
   }
 
-  function buildPagerEntries(): PagerEntry[] {
+  function startJobById(id: string): void {
+    if (missions.pagerOpen) closePagerPanel();
+    if (!jobs.start(id)) {
+      playSound('error');
+      toast.show(i18n.t('mission.pager.empty'), 'error', 2.2);
+      return;
+    }
+    const def = findJobDef(id);
+    if (def) toast.show(i18n.t(def.titleKey), 'info', 1.8);
+    playSound('success');
+  }
+
+  function startJobByIndex(index: number): void {
+    const statuses = jobs.statuses();
+    const entry = statuses[index - 1];
+    if (entry && entry.cooldown <= 0) startJobById(entry.def.id);
+  }
+
+  /** Пейджер: заказы и подработки на двух вкладках (R-02/R-16). */
+  function buildPagerTabs(): PagerTab[] {
     const statuses = missions.statuses();
-    const entries: PagerEntry[] = [];
+    const missionEntries: PagerEntry[] = [];
     for (let i = 0; i < statuses.length; i += 1) {
       const entry = statuses[i];
       const def = entry.def;
@@ -1348,7 +1829,7 @@ export function bootstrap(): void {
       } else if (entry.status === 'cooldown') {
         statusNote = i18n.t('mission.pager.cooldown', { time: i18n.formatTime(entry.cooldown) });
       }
-      entries.push({
+      missionEntries.push({
         id: def.id,
         index: i + 1,
         title: i18n.t(def.titleKey),
@@ -1363,7 +1844,36 @@ export function bootstrap(): void {
         statusNote,
       });
     }
-    return entries;
+
+    const jobStatuses = jobs.statuses();
+    const jobEntries: PagerEntry[] = [];
+    for (let i = 0; i < jobStatuses.length; i += 1) {
+      const entry = jobStatuses[i];
+      const def = entry.def;
+      const busy = jobs.activeId !== null;
+      const blocked = entry.cooldown > 0 || busy;
+      jobEntries.push({
+        id: def.id,
+        index: i + 1,
+        title: i18n.t(def.titleKey),
+        desc: i18n.t(def.descKey),
+        typeLabel: i18n.t('job.pager.type'),
+        reward: `${i18n.t('hud.currency')}${i18n.formatNumber(def.reward)}`,
+        time: i18n.t('mission.pager.time', { time: i18n.formatTime(def.duration) }),
+        status: blocked ? 'cooldown' : 'available',
+        statusNote:
+          entry.cooldown > 0
+            ? i18n.t('mission.pager.cooldown', { time: i18n.formatTime(entry.cooldown) })
+            : busy
+              ? i18n.t('mission.active')
+              : null,
+      });
+    }
+
+    return [
+      { id: 'missions', label: i18n.t('mission.pager.title'), entries: missionEntries },
+      { id: 'jobs', label: i18n.t('job.pager.tab'), entries: jobEntries },
+    ];
   }
 
   function setLanguage(lang: LangCode): void {
@@ -1374,11 +1884,13 @@ export function bootstrap(): void {
   function setVolume(volume: number): void {
     uiSettings.volume = clamp(volume, 0, 1);
     audio.setVolume(uiSettings.volume);
+    radio.setVolume(uiSettings.volume);
   }
 
   function setMuted(muted: boolean): void {
     uiSettings.muted = muted;
     audio.setMuted(muted);
+    radio.setMuted(muted);
   }
 
   function setQuality(quality: UiQuality): void {
@@ -1577,6 +2089,42 @@ export function bootstrap(): void {
           : i18n.t('shop.needGarage', { distance }),
         upgrades,
       },
+      progress: {
+        achievements: achievements.list().map((entry) => ({
+          id: entry.id,
+          title: i18n.t(entry.titleKey),
+          desc: i18n.t(entry.descKey),
+          glyph: entry.glyph,
+          unlocked: entry.unlocked,
+          progress: entry.progress,
+          target: entry.target,
+          reward: `${i18n.t('hud.currency')}${i18n.formatNumber(entry.reward)}`,
+        })),
+        found: achievements.found,
+        total: achievements.total,
+        packages: { found: collectibles.packagesFound, total: collectibles.packagesTotal },
+        ramps: { found: collectibles.rampsFound, total: collectibles.rampsTotal },
+        cars: { found: collectibles.carsFound, total: collectibles.carsTotal },
+        uniqueCars: collectibles.uniqueCars.map((slot) => ({
+          name: i18n.t(slot.nameKey),
+          delivered: collectibles.isCarDelivered(slot.index),
+        })),
+        jobs: JOBS.map((def) => ({
+          name: i18n.t(def.titleKey),
+          count: jobs.completedCount(def.id),
+        })),
+        rows: [
+          i18n.t('menu.stats.missions', { value: statsState.missionsCompleted }),
+          i18n.t('menu.stats.failed', { value: statsState.missionsFailed }),
+          i18n.t('menu.stats.earned', {
+            value: `${i18n.t('hud.currency')}${i18n.formatNumber(economy.earned)}`,
+          }),
+          i18n.t('menu.stats.playTime', { value: i18n.formatTime(statsState.playSeconds) }),
+          i18n.t('progress.time', { time: i18n.t(dayNight.labelKey()) }),
+        ],
+        radio: i18n.t(radio.stationKey),
+        time: i18n.t(dayNight.labelKey()),
+      },
     };
   }
 
@@ -1591,6 +2139,13 @@ export function bootstrap(): void {
       missions: {
         completed: [...missionProgress.completed],
         cooldowns: { ...missionProgress.cooldowns },
+      },
+      progress: {
+        collectibles: collectibles.save(),
+        achievements: achievements.save(),
+        jobs: jobs.save(),
+        dayPhase: dayNight.phase,
+        radioStation: radio.stationIndex,
       },
       settings: { ...uiSettings },
       stats: { ...statsState },
@@ -1627,6 +2182,17 @@ export function bootstrap(): void {
     statsState.playSeconds = profile.stats.playSeconds;
     releaseMissionCar();
 
+    // M8: прогресс коллекций, достижений и подработок.
+    jobs.restore(profile.progress.jobs);
+    collectibles.restore(profile.progress.collectibles);
+    achievements.restore(profile.progress.achievements);
+    events.reset();
+    dayNight.setPhase(profile.progress.dayPhase);
+    radio.setStation(profile.progress.radioStation);
+    maxWantedStars = achievements.stats.maxStars;
+    totalWrecks = achievements.stats.wrecks;
+    respawnUniqueCars();
+
     uiSettings.lang = profile.settings.lang;
     uiSettings.volume = profile.settings.volume;
     uiSettings.muted = profile.settings.muted;
@@ -1637,6 +2203,8 @@ export function bootstrap(): void {
     i18n.setLang(uiSettings.lang);
     audio.setVolume(uiSettings.volume);
     audio.setMuted(uiSettings.muted);
+    radio.setVolume(uiSettings.volume);
+    radio.setMuted(uiSettings.muted);
     mobile.setMode(uiSettings.touch);
     applyQuality();
     menu.refresh();
@@ -1658,6 +2226,16 @@ export function bootstrap(): void {
   function resetProgress(): void {
     economy.reset();
     missions.reset();
+    jobs.reset();
+    events.reset();
+    clearUniqueCars();
+    collectibles.reset();
+    achievements.reset();
+    maxWantedStars = 0;
+    totalWrecks = 0;
+    dayNight.setPhase(DAY_NIGHT.startPhase);
+    radio.setStation(0);
+    spawnUniqueCars();
     releaseMissionCar();
     statsState.missionsCompleted = 0;
     statsState.missionsFailed = 0;
@@ -1681,6 +2259,54 @@ export function bootstrap(): void {
   // Тяжёлая диагностика мира (layoutHash, info) считается только под ?debug=1.
   {
     const activeVehicle = (): VehicleState | null => playerController.vehicle ?? fleet.list[0] ?? null;
+
+    /** Снимок коллекций + ближайшие цели для смоука. */
+    const collectiblesState = (): Record<string, number | string> => {
+      const position = playerWorldPosition();
+      let nearestPackageX = 0;
+      let nearestPackageZ = 0;
+      let bestPackage = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < collectibles.packagePoints.length; i += 1) {
+        if (collectibles.isPackageCollected(i)) continue;
+        const point = collectibles.packagePoints[i];
+        const dx = point.x - position.x;
+        const dz = point.z - position.z;
+        const distance = dx * dx + dz * dz;
+        if (distance < bestPackage) {
+          bestPackage = distance;
+          nearestPackageX = point.x;
+          nearestPackageZ = point.z;
+        }
+      }
+      let nearestRampX = 0;
+      let nearestRampZ = 0;
+      let bestRamp = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < collectibles.rampPoints.length; i += 1) {
+        if (collectibles.isRampJumped(i)) continue;
+        const ramp = collectibles.rampPoints[i];
+        const dx = ramp.x - position.x;
+        const dz = ramp.z - position.z;
+        const distance = dx * dx + dz * dz;
+        if (distance < bestRamp) {
+          bestRamp = distance;
+          nearestRampX = ramp.x;
+          nearestRampZ = ramp.z;
+        }
+      }
+      return {
+        packages: collectibles.packagesFound,
+        packageTotal: collectibles.packagesTotal,
+        ramps: collectibles.rampsFound,
+        rampTotal: collectibles.rampsTotal,
+        cars: collectibles.carsFound,
+        carTotal: collectibles.carsTotal,
+        nearestPackageX: Number(nearestPackageX.toFixed(1)),
+        nearestPackageZ: Number(nearestPackageZ.toFixed(1)),
+        nearestRampX: Number(nearestRampX.toFixed(1)),
+        nearestRampZ: Number(nearestRampZ.toFixed(1)),
+        flight: collectibles.activeFlight ? 1 : 0,
+      };
+    };
 
     window.__tmc = {
       mapId: world.mapId,
@@ -2132,6 +2758,62 @@ export function bootstrap(): void {
           statsVisible: statsElement && !statsElement.hidden ? 1 : 0,
         };
       },
+      events: () =>
+        events.events().map((event) => ({
+          id: event.id,
+          x: Math.round(event.x),
+          z: Math.round(event.z),
+          remaining: Number(event.remaining.toFixed(1)),
+          reward: event.reward,
+        })),
+      forceEvent: (id, x, z) => events.forceEvent(id, x, z),
+      cancelEvent: () => events.cancelEvent(),
+      jobs: () => {
+        const state = jobs.hud();
+        return {
+          active: jobs.activeId ?? '',
+          completed: jobs.kindsCompleted,
+          remaining: state ? Number(state.remaining.toFixed(1)) : -1,
+          mode: state ? state.mode : '',
+        };
+      },
+      jobList: () =>
+        jobs.statuses().map((status) => ({
+          id: status.def.id,
+          cooldown: Number(status.cooldown.toFixed(1)),
+        })),
+      startJob: (id) => (jobs.start(id) ? 1 : 0),
+      collectibles: () => collectiblesState(),
+      collections: () => collectiblesState(),
+      achievements: () =>
+        achievements.list().map((item) => ({
+          id: item.id,
+          unlocked: item.unlocked ? 1 : 0,
+          progress: item.progress,
+          target: item.target,
+        })),
+      radio: () => ({
+        station: radio.stationIndex,
+        available: radio.available ? 1 : 0,
+        news: radio.newsCount,
+      }),
+      dayNight: () => {
+        const sample = dayNight.state;
+        return {
+          phase: Number(sample.phase.toFixed(3)),
+          hour: Number(sample.hour.toFixed(2)),
+          night: Number(sample.night.toFixed(2)),
+        };
+      },
+      interest: () => ({
+        events: events.activeCount,
+        jobsCompleted: jobs.kindsCompleted,
+        packages: collectibles.packagesFound,
+        ramps: collectibles.rampsFound,
+        cars: collectibles.carsFound,
+        achievements: achievements.found,
+        station: radio.stationIndex,
+      }),
     };
   }
 
@@ -2184,6 +2866,95 @@ export function bootstrap(): void {
     };
   }
 
+  /** Текст цели подработки по режиму HUD. */
+  function jobObjectiveText(state: JobHudState): string {
+    switch (state.mode) {
+      case 'vehicle':
+        return i18n.t('job.objective.toVehicle');
+      case 'start':
+        return i18n.t('job.objective.toStart', { place: i18n.t(state.placeKey) });
+      case 'stop':
+        return i18n.t('job.objective.stop', {
+          index: state.index,
+          total: state.total,
+          place: i18n.t(state.placeKey),
+        });
+      case 'checkpoint':
+        return i18n.t('job.objective.checkpoint', {
+          index: state.index,
+          total: state.total,
+          place: i18n.t(state.placeKey),
+        });
+      default:
+        return i18n.t('job.objective.rampage', {
+          done: state.wrecks,
+          total: state.wreckTarget,
+        });
+    }
+  }
+
+  /** Строка события/подработки для HUD (одна панель — R-03). */
+  function hudActivity(): HudActivity | null {
+    const job = jobs.hud();
+    if (job) {
+      const objective = job.needVehicle
+        ? `${jobObjectiveText(job)} · ${i18n.t('job.objective.needVehicle')}`
+        : jobObjectiveText(job);
+      return {
+        kind: 'job',
+        tag: i18n.t('job.hud.tag'),
+        title: i18n.t(job.titleKey),
+        objective,
+        timer: i18n.formatTime(job.legRemaining ?? job.remaining),
+        distance:
+          job.distance > 0
+            ? i18n.t('mission.distance', { meters: Math.round(job.distance) })
+            : null,
+        progress:
+          job.mode === 'stop' || job.mode === 'checkpoint'
+            ? i18n.t('job.progress', { index: job.index, total: job.total })
+            : null,
+        urgent: job.urgent,
+      };
+    }
+    const event = events.hud();
+    if (event) {
+      return {
+        kind: 'event',
+        tag: i18n.t('event.tag'),
+        title: i18n.t(event.titleKey),
+        objective: i18n.t(event.descKey),
+        timer: i18n.formatTime(event.remaining),
+        distance: i18n.t('mission.distance', { meters: Math.round(event.distance) }),
+        progress:
+          event.more > 0
+            ? i18n.t('event.more', { count: event.more })
+            : event.hold > 0
+              ? `${Math.round(event.hold * 100)}%`
+              : null,
+        urgent: event.remaining <= 12,
+      };
+    }
+    return null;
+  }
+
+  /** Счётчики коллекций и достижений одной строкой. */
+  function counterText(): string {
+    const collect = i18n.t('collectible.hud', {
+      packages: collectibles.packagesFound,
+      packageTotal: collectibles.packagesTotal,
+      cars: collectibles.carsFound,
+      carTotal: collectibles.carsTotal,
+      ramps: collectibles.rampsFound,
+      rampTotal: collectibles.rampsTotal,
+    });
+    const ach = i18n.t('achievement.counter', {
+      found: achievements.found,
+      total: achievements.total,
+    });
+    return `${collect} · ${ach}`;
+  }
+
   function buildPrompt(driving: boolean): string {
     const missionHint = i18n.t('hud.prompt.mission');
     if (driving) {
@@ -2203,6 +2974,9 @@ export function bootstrap(): void {
       ? Math.hypot(vehicle.transform.vx, vehicle.transform.vz) * 3.6
       : Math.hypot(playerTransform.vx, playerTransform.vz) * 3.6;
 
+    // Достижения сверяются на HUD-тике, а не в каждом шаге физики.
+    syncAchievements();
+
     hud.update({
       money: economy.money,
       health: wanted.health,
@@ -2216,6 +2990,8 @@ export function bootstrap(): void {
         reloading: combat.isReloading,
       },
       mission: hudMission(),
+      activity: hudActivity(),
+      counter: counterText(),
       prompt: uiSettings.hints ? buildPrompt(driving) : null,
     });
 
@@ -2241,12 +3017,21 @@ export function bootstrap(): void {
       });
     }
     markers.push({ x: ECONOMY.garage[0], z: ECONOMY.garage[1], kind: 'garage' });
+    const jobMarker = jobs.marker();
+    if (jobMarker) {
+      markers.push({ x: jobMarker.x, z: jobMarker.z, kind: 'job' });
+    } else {
+      const eventMarker = events.marker();
+      if (eventMarker) markers.push({ x: eventMarker.x, z: eventMarker.z, kind: 'event' });
+    }
+    collectibles.nearestLoot(position.x, position.z, UI.layout.minimapRange, 24);
     minimap.update({
       playerX: position.x,
       playerZ: position.z,
       playerHeading: vehicle ? vehicle.transform.heading : playerTransform.heading,
       cops,
       markers,
+      loot: collectibles.loot,
     });
   }
 
@@ -2354,6 +3139,8 @@ export function bootstrap(): void {
         continue;
       }
       if (traffic.owns(vehicle.id) || wanted.owns(vehicle.id)) continue;
+      // Машины событий и соперников гонки шагают свои системы (M8).
+      if (events.owns(vehicle.id) || jobs.owns(vehicle.id)) continue;
       physics.step(vehicle, IDLE_VEHICLE_INPUT, dt);
     }
     const physicsMs = performance.now() - physicsStarted;
@@ -2381,6 +3168,22 @@ export function bootstrap(): void {
     missionPlayer.vehicleId = driven ? driven.id : -1;
     missions.update(dt, missionPlayer);
 
+    // --- M8: события, подработки, коллекции, сутки --------------------------
+    lifePlayer.x = missionPlayer.x;
+    lifePlayer.z = missionPlayer.z;
+    lifePlayer.inVehicle = missionPlayer.inVehicle;
+    lifePlayer.vehicleId = missionPlayer.vehicleId;
+    lifePlayer.vehicleType = missionPlayer.vehicleType;
+    lifePlayer.speed = Math.hypot(
+      driven ? driven.transform.vx : playerTransform.vx,
+      driven ? driven.transform.vz : playerTransform.vz,
+    );
+    events.update(dt, lifePlayer);
+    jobs.update(dt, lifePlayer);
+    collectibles.update(dt, lifePlayer);
+    dayNight.update(dt);
+    radio.update(dt);
+
     // Отдача оружия и импульс машины → тряска камеры; взрывы без крови.
     if (combat.recoil > 0.01) {
       shakePower = Math.max(shakePower, clamp(combat.recoil, 0.15, SHAKE_MAX) * 0.5);
@@ -2396,11 +3199,24 @@ export function bootstrap(): void {
       if (!vehicle.justWrecked) continue;
       vehicle.justWrecked = false;
       vehicleView.burst(vehicle.transform.x, vehicle.transform.z, 1);
+      wreckIds.push(vehicle.id);
+      wreckXs.push(vehicle.transform.x);
+      wreckZs.push(vehicle.transform.z);
       if (vehicle === driven) {
         shakePower = SHAKE_MAX;
         shakeTime = SHAKE_DURATION;
       }
     }
+    // Уведомления о разбитых машинах — после обхода флота: сцены и работы
+    // могут освободить машину, и splice внутри цикла испортил бы индексы.
+    for (let i = 0; i < wreckIds.length; i += 1) {
+      totalWrecks += 1;
+      events.notifyWreck(wreckIds[i]);
+      jobs.notifyWreck(wreckXs[i], wreckZs[i]);
+    }
+    wreckIds.length = 0;
+    wreckXs.length = 0;
+    wreckZs.length = 0;
 
     registry.flush();
 
@@ -2438,6 +3254,22 @@ export function bootstrap(): void {
     syncStressMovers(alpha);
     cityView.sync(world);
 
+    // M8: сутки, фары и коллекции — без пересоздания сцены.
+    ambienceTimer -= frameDt;
+    if (ambienceTimer <= 0) {
+      ambienceTimer = DAY_NIGHT.applyInterval;
+      applyAmbience();
+    }
+    const night = dayNight.state.night;
+    nightView.sync(fleet.list, alpha, night, gameTime);
+    lifePropsView.sync(
+      gameTime,
+      night,
+      collectibles.packageMask,
+      collectibles.rampMask,
+      collectibles.uniqueCars,
+    );
+
     if (shakeTime > 0) {
       shakeTime = Math.max(0, shakeTime - frameDt);
       shakePhase += frameDt * 46;
@@ -2447,8 +3279,11 @@ export function bootstrap(): void {
     followCamera.update(frameDt, renderX, renderZ, target.vx, target.vz);
     applyCamera();
 
-    // Маркер заказа: кольцо зоны на земле, цвет по этапу.
+    // Маркер: один 3D-маркер, приоритет миссия > подработка > событие (R-04).
     const missionMarker = missions.marker();
+    const jobMarker = jobs.marker();
+    const eventMarker = events.marker();
+    const activityMarker = jobMarker ?? eventMarker;
     if (missionMarker) {
       missionMarkerView.set(
         missionMarker.x,
@@ -2456,10 +3291,21 @@ export function bootstrap(): void {
         missionMarker.radius,
         missionMarker.kind === 'toStart' ? 0x4dabf7 : 0xffa94d,
       );
+      activityMarkerView.hide();
+    } else if (activityMarker) {
+      missionMarkerView.hide();
+      activityMarkerView.set(
+        activityMarker.x,
+        activityMarker.z,
+        activityMarker.radius,
+        activityMarker.color,
+      );
     } else {
       missionMarkerView.hide();
+      activityMarkerView.hide();
     }
     missionMarkerView.update(frameDt);
+    activityMarkerView.update(frameDt);
 
     // Сирена и визг шин идут от состояния, а не от событий: нет сирены — тишина.
     const sirenDistance = wanted.sirenNear

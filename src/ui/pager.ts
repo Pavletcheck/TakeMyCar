@@ -1,7 +1,9 @@
 // ---------------------------------------------------------------------------
-// M6. Телефон-пейджер: список заказов со статусами, наградой и временем.
-// Компонент только показывает данные и сообщает о выборе; миссии и деньги
-// живут в systems/missions и systems/economy.
+// M6/M8. Телефон-пейджер: заказы и подработки на вкладках.
+//
+// Компонент только показывает данные и сообщает о выборе; миссии, работы и
+// деньги живут в systems. Вкладки появились в M8, чтобы Digit* выбирал
+// элемент активной вкладки, а не 12 позиций подряд (R-16).
 // ---------------------------------------------------------------------------
 
 import type { UiConfig } from '../config/ui';
@@ -11,7 +13,7 @@ export type PagerEntryStatus = 'available' | 'locked' | 'cooldown';
 
 export interface PagerEntry {
   readonly id: string;
-  /** Номер для клавиш 1..5. */
+  /** Номер для клавиш 1..9. */
   readonly index: number;
   readonly title: string;
   readonly desc: string;
@@ -22,10 +24,18 @@ export interface PagerEntry {
   readonly statusNote: string | null;
 }
 
+export interface PagerTab {
+  readonly id: string;
+  readonly label: string;
+  readonly entries: readonly PagerEntry[];
+}
+
 export interface Pager {
   readonly isOpen: boolean;
-  open(entries: readonly PagerEntry[], onAccept: (id: string) => void): void;
-  refresh(entries: readonly PagerEntry[]): void;
+  readonly activeTab: string;
+  open(tabs: readonly PagerTab[], onAccept: (id: string) => void, activeTab?: string): void;
+  refresh(tabs: readonly PagerTab[], activeTab?: string): void;
+  setActiveTab(id: string): void;
   close(): void;
   dispose(): void;
 }
@@ -64,23 +74,50 @@ export function createPager(
   closeButton.setAttribute('aria-label', i18n.t('common.close'));
   head.append(title, closeButton);
 
+  const tabsBar = el('div', 'tmc-pager__tabs');
   const list = el('div', 'tmc-pager__list');
   const hint = el('div', 'tmc-pager__hint', i18n.t('mission.pager.hint'));
-  panel.append(head, list, hint);
+  panel.append(head, tabsBar, list, hint);
   root.appendChild(panel);
   container.appendChild(root);
 
   let openValue = false;
   let onAcceptValue: ((id: string) => void) | null = null;
-  let entriesValue: readonly PagerEntry[] = [];
+  let tabsValue: readonly PagerTab[] = [];
+  let activeTabValue = '';
+
+  const activeEntries = (): readonly PagerEntry[] => {
+    for (let i = 0; i < tabsValue.length; i += 1) {
+      if (tabsValue[i].id === activeTabValue) return tabsValue[i].entries;
+    }
+    return tabsValue.length > 0 ? tabsValue[0].entries : [];
+  };
+
+  const renderTabs = (): void => {
+    tabsBar.textContent = '';
+    tabsBar.hidden = tabsValue.length <= 1;
+    for (let i = 0; i < tabsValue.length; i += 1) {
+      const tab = tabsValue[i];
+      const node = el('button', 'tmc-pager__tab', tab.label);
+      node.type = 'button';
+      node.classList.toggle('tmc-pager__tab--active', tab.id === activeTabValue);
+      node.addEventListener('click', () => {
+        activeTabValue = tab.id;
+        render();
+      });
+      tabsBar.appendChild(node);
+    }
+  };
 
   const render = (): void => {
+    renderTabs();
     list.textContent = '';
-    if (entriesValue.length === 0) {
+    const entries = activeEntries();
+    if (entries.length === 0) {
       list.appendChild(el('div', 'tmc-pager__empty', i18n.t('mission.pager.empty')));
       return;
     }
-    for (const entry of entriesValue) {
+    for (const entry of entries) {
       const card = el('button', 'tmc-job');
       card.type = 'button';
       card.dataset.missionId = entry.id;
@@ -109,6 +146,16 @@ export function createPager(
     }
   };
 
+  const setActiveTab = (id: string): void => {
+    for (let i = 0; i < tabsValue.length; i += 1) {
+      if (tabsValue[i].id === id) {
+        activeTabValue = id;
+        if (openValue) render();
+        return;
+      }
+    }
+  };
+
   closeButton.addEventListener('click', () => {
     openValue = false;
     root.hidden = true;
@@ -119,21 +166,29 @@ export function createPager(
     get isOpen() {
       return openValue;
     },
-    open(entries: readonly PagerEntry[], onAccept: (id: string) => void): void {
-      entriesValue = entries;
+    get activeTab() {
+      return activeTabValue;
+    },
+    open(tabs: readonly PagerTab[], onAccept: (id: string) => void, activeTab?: string): void {
+      tabsValue = tabs;
       onAcceptValue = onAccept;
       openValue = true;
+      activeTabValue = activeTab ?? (tabs.length > 0 ? tabs[0].id : '');
       title.textContent = i18n.t('mission.pager.title');
       hint.textContent = i18n.t('mission.pager.hint');
       render();
       root.hidden = false;
     },
-    refresh(entries: readonly PagerEntry[]): void {
-      entriesValue = entries;
-      title.textContent = i18n.t('mission.pager.title');
-      hint.textContent = i18n.t('mission.pager.hint');
-      if (openValue) render();
+    refresh(tabs: readonly PagerTab[], activeTab?: string): void {
+      tabsValue = tabs;
+      if (activeTab !== undefined) activeTabValue = activeTab;
+      if (openValue) {
+        title.textContent = i18n.t('mission.pager.title');
+        hint.textContent = i18n.t('mission.pager.hint');
+        render();
+      }
     },
+    setActiveTab,
     close(): void {
       openValue = false;
       root.hidden = true;
