@@ -2,11 +2,12 @@
 // Three-слой города: InstancedMesh по чанкам, общие геометрии и материалы.
 // World остаётся чистым данным; здесь только визуализация.
 //
-// Бюджет draw calls (M3-A-18): на чанк не больше 3 инстанс-мешей —
-//   1) box      — плиты кварталов, коробки зданий, крыши, «коробочные» пропсы;
-//   2) cylinder — столбы, гидранты, стволы;
-//   3) cone     — кроны деревьев.
-// Frustum culling — по bounding sphere каждого чанка (Three делает это сам).
+// M7.1: здания и пропсы живут не по чанкам, а общими инстанс-сетами:
+//   - постройки — 4 бакета по высоте × LOD0/LOD1 (ближе 90 м к камере — LOD0);
+//   - пропсы — «вид:вариант» (≤16 мешей), пивот по основанию;
+//   - плиты кварталов и крыши коробок — по чанкам (≤2 instanced-меша).
+// При `?models=0` или ошибке загрузки GLB остаются прежние коробки/примитивы.
+// Общие геометрии моделей не освобождаются при выгрузке чанка (BUG-M7-008).
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
@@ -15,6 +16,7 @@ import { propVariant } from '../world/props';
 import type { BuildingInstance, Chunk, PlateInstance, PropInstance } from '../world/types';
 import type { World } from '../world/world';
 import {
+  BUILDING_MODEL_URLS,
   PROP_MODEL_URLS,
   createFlatMaterial,
   createPartInstances,
@@ -24,6 +26,7 @@ import {
   retainModels,
 } from './modelLibrary';
 import type { ModelPart } from './modelLibrary';
+import { getViewFocus } from './viewFocus';
 
 /** Высота плоскости воды: выше земли, ниже плит кварталов. */
 const WATER_Y = 0.1;
@@ -34,6 +37,38 @@ const DASH_STEP = 9;
 const DASH_MARGIN = 12;
 const ROOF_HEIGHT = 0.36;
 const ROOF_OVERHANG = 0.7;
+
+/**
+ * Бакеты зданий: выбор модели по высоте, канонические габариты (w, h, d) —
+ * модель масштабируется под w/d/h из мира, пивот по центру основания.
+ * Канон снят с медиан карты (дома 22–60 м в плане), поэтому масштаб ≈ 1
+ * и окна/крышные детали не растягиваются (см. tools/blender/build_buildings.py).
+ */
+const BUILDING_BUCKETS = [
+  { key: 'small', maxHeight: 12, size: [30, 8, 28] },
+  { key: 'mid', maxHeight: 26, size: [30, 16, 30] },
+  { key: 'tall', maxHeight: 40, size: [34, 28, 34] },
+  { key: 'tower', maxHeight: Number.POSITIVE_INFINITY, size: [44, 44, 36] },
+] as const;
+
+/** Ближе этого расстояния до камеры дом рисуется LOD0, дальше — LOD1. */
+const BUILDING_LOD_DISTANCE = 90;
+const BUILDING_LOD_DISTANCE_SQ = BUILDING_LOD_DISTANCE * BUILDING_LOD_DISTANCE;
+/** Дальше этого расстояния дом не рисуется: за кадром ортокамеры и в тумане. */
+const BUILDING_DRAW_DISTANCE = 160;
+const BUILDING_DRAW_DISTANCE_SQ = BUILDING_DRAW_DISTANCE * BUILDING_DRAW_DISTANCE;
+/** Пропсы дальше этого расстояния не рисуются (орто-вид ~110 м + запас). */
+const PROP_DRAW_DISTANCE = 150;
+const PROP_DRAW_DISTANCE_SQ = PROP_DRAW_DISTANCE * PROP_DRAW_DISTANCE;
+/** Пересборка LOD зданий и пропсов при смещении камеры на это расстояние, м. */
+const BUILDING_LOD_STEP = 10;
+
+function buildingBucket(height: number): (typeof BUILDING_BUCKETS)[number] {
+  for (const bucket of BUILDING_BUCKETS) {
+    if (height < bucket.maxHeight) return bucket;
+  }
+  return BUILDING_BUCKETS[BUILDING_BUCKETS.length - 1];
+}
 
 type Bucket = 'box' | 'cylinder' | 'cone';
 
@@ -58,6 +93,12 @@ export interface CityViewStats {
   propModels: boolean;
   /** Сколько разных ключей «вид:вариант» в инстанс-сете пропсов. */
   propMeshes: number;
+  /** Здания нарисованы GLB-моделями (иначе — коробками). */
+  buildingModels: boolean;
+  /** Сколько инстанс-мешей зданий (бакеты × LOD). */
+  buildingMeshes: number;
+  /** Сколько домов на LOD1. */
+  buildingsLod1: number;
 }
 
 export interface CityView {
@@ -87,11 +128,23 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
   const propGroup = new THREE.Group();
   propGroup.name = 'props';
   root.add(propGroup);
-  const propMaterial = createFlatMaterial();
+  const flatMaterial = createFlatMaterial();
   const propModels = new Map<string, ModelPart>();
   const propMeshes = new Map<string, THREE.InstancedMesh>();
   let propsReady = false;
   let propsActive = false;
+
+  // --- здания: 4 бакета по высоте × LOD0/LOD1, тоже вне чанков (M7.1) ------
+  const bldGroup = new THREE.Group();
+  bldGroup.name = 'buildings';
+  root.add(bldGroup);
+  const bldModels = new Map<string, { lod0: ModelPart; lod1: ModelPart }>();
+  /** Меши бакета: две ёмкости (LOD0/LOD1) на весь активный город. */
+  const bldMeshes = new Map<string, { lod0: THREE.InstancedMesh; lod1: THREE.InstancedMesh }>();
+  let bldReady = false;
+  let bldActive = false;
+  let bldLodOriginX = Number.NaN;
+  let bldLodOriginZ = Number.NaN;
   let disposed = false;
   retainModels();
 
@@ -114,7 +167,34 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
     }
   };
 
-  if (!modelsDisabled()) void loadPropModels();
+  const loadBuildingModels = async (): Promise<void> => {
+    try {
+      const loaded = await Promise.all(
+        Object.entries(BUILDING_MODEL_URLS).map(async ([key, urls]) => {
+          const [lod0Parts, lod1Parts] = await Promise.all([
+            loadModelParts(urls.lod0),
+            loadModelParts(urls.lod1),
+          ]);
+          const lod0 = lod0Parts.get('bld');
+          const lod1 = lod1Parts.get('bld');
+          if (!lod0 || !lod1) throw new Error(`${urls.lod0}: нет узла bld`);
+          return [key, { lod0, lod1 }] as const;
+        }),
+      );
+      if (disposed) return;
+      for (const [key, model] of loaded) bldModels.set(key, model);
+      bldReady = true;
+    } catch {
+      // Частичный набор бакетов не годится: дома остаются коробками.
+      bldModels.clear();
+      bldReady = false;
+    }
+  };
+
+  if (!modelsDisabled()) {
+    void loadPropModels();
+    void loadBuildingModels();
+  }
 
   const dummy = new THREE.Object3D();
   const tint = new THREE.Color();
@@ -126,6 +206,9 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
     instances: 0,
     propModels: false,
     propMeshes: 0,
+    buildingModels: false,
+    buildingMeshes: 0,
+    buildingsLod1: 0,
   };
 
   let staticBuilt = false;
@@ -233,7 +316,8 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
     const buildings = chunk.buildings;
     const props = chunk.props;
 
-    counts.box += plates.length + buildings.length * 2;
+    // Дома на GLB рисуются общим слоем (бакеты × LOD), иначе — коробки с крышей.
+    counts.box += plates.length + (bldReady ? 0 : buildings.length * 2);
     if (!propsReady) {
       for (let i = 0; i < props.length; i += 1) {
         const variant = propVariant(props[i].kind, props[i].variant);
@@ -343,7 +427,9 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
     };
 
     for (let i = 0; i < plates.length; i += 1) addPlate(plates[i]);
-    for (let i = 0; i < buildings.length; i += 1) addBuilding(buildings[i]);
+    if (!bldReady) {
+      for (let i = 0; i < buildings.length; i += 1) addBuilding(buildings[i]);
+    }
     // Пропсы на GLB живут в общем слое вне чанков; примитивы — запасной путь.
     if (!propsReady) {
       for (let i = 0; i < props.length; i += 1) addProp(props[i]);
@@ -395,64 +481,215 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
     for (const [key, list] of groups) {
       const part = propModels.get(key);
       if (!part) continue;
-      const mesh = createPartInstances(part, propMaterial, list.length);
-      for (let i = 0; i < list.length; i += 1) {
-        const prop = list[i];
-        dummy.position.set(prop.x, config.curbHeight, prop.z);
-        dummy.rotation.set(0, prop.heading, 0);
-        dummy.scale.setScalar(prop.scale);
-        dummy.updateMatrix();
-        // Пивот пропса — по основанию, поэтому матрица узла — почти identity.
-        mesh.setMatrixAt(i, dummy.matrix);
-      }
-      mesh.count = list.length;
-      mesh.instanceMatrix.needsUpdate = true;
+      const mesh = createPartInstances(part, flatMaterial, list.length);
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
-      // Пропсы статичны: bounding sphere по инстансам даёт честный frustum culling.
-      mesh.frustumCulled = true;
-      mesh.computeBoundingSphere();
+      // Дальность отсекается вручную (см. writeProps), culling по чанкам не нужен.
+      mesh.frustumCulled = false;
       propGroup.add(mesh);
       propMeshes.set(key, mesh);
     }
   };
 
+  /**
+   * Записать инстансы пропсов в радиусе PROP_DRAW_DISTANCE от камеры.
+   * Ёмкости мешей постоянны до смены чанков, поэтому пересборка дешёвая.
+   */
+  const writeProps = (world: World, focusX: number, focusZ: number): void => {
+    for (const mesh of propMeshes.values()) mesh.count = 0;
+    const active = world.activeChunks;
+    for (let i = 0; i < active.length; i += 1) {
+      const props = active[i].props;
+      for (let p = 0; p < props.length; p += 1) {
+        const prop = props[p];
+        const dx = prop.x - focusX;
+        const dz = prop.z - focusZ;
+        if (dx * dx + dz * dz > PROP_DRAW_DISTANCE_SQ) continue;
+        const mesh = propMeshes.get(`${prop.kind}:${prop.variant}`);
+        if (!mesh) continue;
+        const index = mesh.count;
+        if (index >= mesh.instanceMatrix.count) continue;
+        dummy.position.set(prop.x, config.curbHeight, prop.z);
+        dummy.rotation.set(0, prop.heading, 0);
+        dummy.scale.setScalar(prop.scale);
+        dummy.updateMatrix();
+        // Пивот пропса — по основанию, поэтому матрица узла — почти identity.
+        mesh.setMatrixAt(index, dummy.matrix);
+        mesh.count = index + 1;
+      }
+    }
+    for (const mesh of propMeshes.values()) {
+      if (mesh.count > 0) mesh.instanceMatrix.needsUpdate = true;
+    }
+  };
+
+  // --- здания: бакеты по высоте и дистанционный LOD -------------------------
+
+  /** Освободить инстансы зданий, не трогая общие GLB-геометрии. */
+  const clearBuildings = (): void => {
+    for (const pair of bldMeshes.values()) {
+      bldGroup.remove(pair.lod0, pair.lod1);
+      pair.lod0.dispose();
+      pair.lod1.dispose();
+    }
+    bldMeshes.clear();
+  };
+
+  /**
+   * Пересоздать ёмкости под активные чанки: по одной паре (LOD0/LOD1) на бакет.
+   * Вызывается только при смене набора чанков, не каждый кадр.
+   */
+  const allocateBuildingMeshes = (world: World): void => {
+    clearBuildings();
+    const active = world.activeChunks;
+    const counts = new Map<string, number>();
+    for (let i = 0; i < active.length; i += 1) {
+      const buildings = active[i].buildings;
+      for (let b = 0; b < buildings.length; b += 1) {
+        const key = buildingBucket(buildings[b].h).key;
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+    }
+    for (const [key, count] of counts) {
+      const model = bldModels.get(key);
+      if (!model) continue;
+      const lod0 = createPartInstances(model.lod0, flatMaterial, count);
+      const lod1 = createPartInstances(model.lod1, flatMaterial, count);
+      lod0.castShadow = true;
+      lod1.castShadow = false;
+      lod0.receiveShadow = true;
+      lod1.receiveShadow = true;
+      bldGroup.add(lod0, lod1);
+      bldMeshes.set(key, { lod0, lod1 });
+    }
+  };
+
+  /**
+   * Разложить дома по LOD0/LOD1 относительно камеры и записать матрицы.
+   * Габарит модели масштабируется под w/d/h из мира, поворот — 0 (как у мира).
+   */
+  const writeBuildingInstances = (world: World, focusX: number, focusZ: number): void => {
+    for (const pair of bldMeshes.values()) {
+      pair.lod0.count = 0;
+      pair.lod1.count = 0;
+    }
+    bldLodOriginX = focusX;
+    bldLodOriginZ = focusZ;
+    let lod1Count = 0;
+
+    const active = world.activeChunks;
+    for (let i = 0; i < active.length; i += 1) {
+      const buildings = active[i].buildings;
+      for (let b = 0; b < buildings.length; b += 1) {
+        const building = buildings[b];
+        const bucket = buildingBucket(building.h);
+        const pair = bldMeshes.get(bucket.key);
+        if (!pair) continue;
+        const dx = building.x - focusX;
+        const dz = building.z - focusZ;
+        const distanceSq = dx * dx + dz * dz;
+        // За пределами кадра/в тумане дома не рисуем вовсе.
+        if (distanceSq > BUILDING_DRAW_DISTANCE_SQ) continue;
+        const far = distanceSq > BUILDING_LOD_DISTANCE_SQ;
+        const mesh = far ? pair.lod1 : pair.lod0;
+        const index = mesh.count;
+        if (index >= mesh.instanceMatrix.count) continue;
+        dummy.position.set(building.x, config.curbHeight, building.z);
+        dummy.rotation.set(0, 0, 0);
+        dummy.scale.set(
+          building.w / bucket.size[0],
+          building.h / bucket.size[1],
+          building.d / bucket.size[2],
+        );
+        dummy.updateMatrix();
+        mesh.setMatrixAt(index, dummy.matrix);
+        mesh.setColorAt(index, tint.setHex(building.color));
+        mesh.count = index + 1;
+        if (far) lod1Count += 1;
+      }
+    }
+
+    for (const pair of bldMeshes.values()) {
+      for (const mesh of [pair.lod0, pair.lod1]) {
+        if (mesh.count > 0) {
+          mesh.instanceMatrix.needsUpdate = true;
+          if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+        }
+        // Дома статичны: culling по bounding sphere инстансов работает всегда.
+        mesh.frustumCulled = true;
+        mesh.computeBoundingSphere();
+      }
+    }
+    stats.buildingsLod1 = lod1Count;
+  };
+
+  /** Пора ли пересчитать дальность/LOD: камера ушла дальше шага гистерезиса. */
+  const layersStale = (focusX: number, focusZ: number): boolean => {
+    if (!propsActive && !bldActive) return false;
+    if (!Number.isFinite(bldLodOriginX)) return true;
+    return Math.hypot(focusX - bldLodOriginX, focusZ - bldLodOriginZ) > BUILDING_LOD_STEP;
+  };
+
   const view: CityView = {
     root,
     stats,
-
     sync(world) {
       if (!staticBuilt) buildStatic(world);
 
-      // Модели пропсов пришли позже чанков: пересобрать слой один раз.
-      if (propsReady !== propsActive) {
+      // Модели пришли позже чанков: один раз пересобрать слои и коробки.
+      if (propsReady !== propsActive || bldReady !== bldActive) {
         propsActive = propsReady;
+        bldActive = bldReady;
         for (const render of renders.values()) removeChunk(render);
         renders.clear();
         clearProps();
+        clearBuildings();
+        bldLodOriginX = Number.NaN;
         lastRevision = -1;
       }
 
-      if (world.revision === lastRevision) return;
-      lastRevision = world.revision;
+      const focus = getViewFocus();
+      const revisionChanged = world.revision !== lastRevision;
 
-      seen.clear();
-      const active = world.activeChunks;
-      for (let i = 0; i < active.length; i += 1) {
-        const chunk = active[i];
-        const key = chunk.renderRef;
-        seen.add(key);
-        if (!renders.has(key)) renders.set(key, buildChunk(chunk));
+      if (!revisionChanged && !layersStale(focus.x, focus.z)) return;
+
+      if (revisionChanged) {
+        lastRevision = world.revision;
+
+        seen.clear();
+        const active = world.activeChunks;
+        for (let i = 0; i < active.length; i += 1) {
+          const chunk = active[i];
+          const key = chunk.renderRef;
+          seen.add(key);
+          if (!renders.has(key)) renders.set(key, buildChunk(chunk));
+        }
+
+        for (const entry of renders) {
+          if (seen.has(entry[0])) continue;
+          removeChunk(entry[1]);
+          renders.delete(entry[0]);
+        }
+
+        if (propsActive) {
+          rebuildProps(world);
+          writeProps(world, focus.x, focus.z);
+        } else {
+          clearProps();
+        }
+
+        if (bldActive) {
+          allocateBuildingMeshes(world);
+          writeBuildingInstances(world, focus.x, focus.z);
+        } else {
+          clearBuildings();
+        }
+      } else if (bldActive || propsActive) {
+        // Камера уехала: пересчёт дальности/LOD без пересборки чанков.
+        if (propsActive) writeProps(world, focus.x, focus.z);
+        if (bldActive) writeBuildingInstances(world, focus.x, focus.z);
       }
-
-      for (const entry of renders) {
-        if (seen.has(entry[0])) continue;
-        removeChunk(entry[1]);
-        renders.delete(entry[0]);
-      }
-
-      if (propsActive) rebuildProps(world);
-      else clearProps();
 
       let meshCount = 0;
       let instanceCount = 0;
@@ -460,16 +697,24 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
         meshCount += render.meshes.length;
         instanceCount += render.instances;
       }
+      let bldMeshCount = 0;
+      for (const pair of bldMeshes.values()) {
+        if (pair.lod0.count > 0) bldMeshCount += 1;
+        if (pair.lod1.count > 0) bldMeshCount += 1;
+      }
       stats.chunks = renders.size;
-      stats.meshes = meshCount + propMeshes.size;
+      stats.meshes = meshCount + propMeshes.size + bldMeshCount;
       stats.instances = instanceCount;
       stats.propModels = propsActive;
       stats.propMeshes = propMeshes.size;
+      stats.buildingModels = bldActive;
+      stats.buildingMeshes = bldMeshCount;
     },
 
     dispose() {
       disposed = true;
       clearProps();
+      clearBuildings();
       for (const render of renders.values()) removeChunk(render);
       renders.clear();
       if (groundMesh) {
@@ -497,7 +742,7 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
       groundMaterial.dispose();
       waterMaterial.dispose();
       markingMaterial.dispose();
-      propMaterial.dispose();
+      flatMaterial.dispose();
       // Геометрии GLB общие для всех view: освобождаются по счётчику ссылок.
       releaseModels();
       stats.chunks = 0;
@@ -505,6 +750,9 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
       stats.instances = 0;
       stats.propModels = false;
       stats.propMeshes = 0;
+      stats.buildingModels = false;
+      stats.buildingMeshes = 0;
+      stats.buildingsLod1 = 0;
     },
   };
 

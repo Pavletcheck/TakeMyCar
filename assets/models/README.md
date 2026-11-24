@@ -7,7 +7,8 @@
 - `cars/` — sedan, sports, van, truck, police (`*_lod0.glb`, `*_lod1.glb`).
 - `characters/` — `ped_base_lod0`, `ped_cop_lod0` + части (`torso`, `head`, `arm_*`, `leg_*`).
 - `props/` — фонари, урны, гидранты, деревья, скамейки, билборды, заборы.
-- `buildings/` — модульный кит: стена, угол, крыша, парапет, вывеска.
+- `buildings/` — готовые дома: `bld_block_small/mid/tall`, `bld_tower` (392–584 tris, LOD1 72)
+  + модульный кит (стена, угол, крыша, парапет, вывеска).
 
 ## Загрузка в игре
 `src/render/modelLibrary.ts` кэширует GLB, пути строятся от `import.meta.env.BASE_URL`
