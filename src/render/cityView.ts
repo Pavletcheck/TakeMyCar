@@ -11,6 +11,7 @@
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
+import asphaltUrl from '../../assets/textures/ground/asphalt.webp?url';
 import type { WorldConfig } from '../config/world';
 import { propVariant } from '../world/props';
 import type { BuildingInstance, Chunk, PlateInstance, PropInstance } from '../world/types';
@@ -118,7 +119,14 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
   const cylinderGeometry = new THREE.CylinderGeometry(0.5, 0.5, 1, 8);
   const coneGeometry = new THREE.ConeGeometry(0.5, 1, 6);
   const cityMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
-  const groundMaterial = new THREE.MeshLambertMaterial({ color: config.colors.ground });
+  // M7.2: асфальт из ComfyUI; тайлится по всей плоскости города.
+  const asphaltTexture = new THREE.TextureLoader().load(asphaltUrl);
+  asphaltTexture.wrapS = THREE.RepeatWrapping;
+  asphaltTexture.wrapT = THREE.RepeatWrapping;
+  asphaltTexture.repeat.set(72, 72);
+  asphaltTexture.colorSpace = THREE.SRGBColorSpace;
+  asphaltTexture.anisotropy = 4;
+  const groundMaterial = new THREE.MeshLambertMaterial({ color: 0x8a9096, map: asphaltTexture });
   const waterMaterial = new THREE.MeshLambertMaterial({ color: config.colors.water });
   const markingMaterial = new THREE.MeshBasicMaterial({ color: config.colors.marking });
   const dashGeometry = new THREE.BoxGeometry(0.28, 0.04, DASH_LENGTH);
@@ -739,6 +747,7 @@ export function createCityView(scene: THREE.Scene, config: WorldConfig): CityVie
       coneGeometry.dispose();
       dashGeometry.dispose();
       cityMaterial.dispose();
+      asphaltTexture.dispose();
       groundMaterial.dispose();
       waterMaterial.dispose();
       markingMaterial.dispose();

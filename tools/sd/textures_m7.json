@@ -1,0 +1,143 @@
+{
+  "_comment": "Итоговый набор текстур этапа M7. seed/subject/negative выбраны вручную по контрольным листам (7 прогонов). Один стиль-суффикс на всю серию; у части материалов негатив ослаблен — с 'photorealistic, noisy' SD рисует предметы вместо поверхности. band — ширина зеркальной сварки шва (доля стороны).",
+  "model": "DreamShaper8_pruned.safetensors",
+  "suffix": "stylized low-poly game texture, flat colors, clean, seamless tileable, top-down, no text, no logo, no watermark",
+  "negative": "text, letters, logo, watermark, seams, border, photorealistic, noisy, vignette, frame, road markings, blurry, low quality, 3d render, perspective, shadow, object, people, cars, buildings, kaleidoscope, flower, swatch, sphere, cube",
+  "sampler": "dpmpp_2m",
+  "scheduler": "karras",
+  "steps": 26,
+  "cfg": 6.5,
+  "candidates": 1,
+  "items": [
+    {
+      "name": "asphalt",
+      "category": "ground",
+      "size": 512,
+      "seed": 940111,
+      "band": 0.10,
+      "subject": "seamless texture of asphalt pavement, fine gravel grain, dark grey, material study",
+      "negative": "text, letters, logo, watermark, seams, border, vignette, frame, road markings, stripes, blurry, low quality, 3d render, perspective, shadow, object, people, cars, buildings, single object, kaleidoscope, swatch, sphere, cube"
+    },
+    {
+      "name": "sidewalk",
+      "category": "ground",
+      "size": 512,
+      "seed": 950411,
+      "band": 0.05,
+      "subject": "grey sidewalk paving stones, top view, seamless background"
+    },
+    {
+      "name": "grass",
+      "category": "ground",
+      "size": 512,
+      "seed": 950131,
+      "band": 0.10,
+      "subject": "grass field texture, small green blades, seamless background",
+      "negative": "text, letters, logo, watermark, seams, border, vignette, frame, road markings, stripes, blurry, low quality, 3d render, perspective, shadow, object, people, cars, buildings, single object, kaleidoscope, flower, clover, swatch, sample, sphere, cube"
+    },
+    {
+      "name": "dirt",
+      "category": "ground",
+      "size": 512,
+      "seed": 950201,
+      "band": 0.10,
+      "subject": "brown dirt ground texture, small pebbles, top view, seamless background"
+    },
+    {
+      "name": "brick",
+      "category": "walls",
+      "size": 256,
+      "seed": 900111,
+      "band": 0.04,
+      "subject": "seamless pattern of red brick wall, running bond, thin mortar joints"
+    },
+    {
+      "name": "plaster",
+      "category": "walls",
+      "size": 256,
+      "seed": 950502,
+      "band": 0.05,
+      "subject": "beige stucco wall texture, top view, seamless background"
+    },
+    {
+      "name": "concrete",
+      "category": "walls",
+      "size": 256,
+      "seed": 950501,
+      "band": 0.05,
+      "subject": "grey concrete wall texture, top view, seamless background",
+      "negative": "text, letters, logo, watermark, seams, border, vignette, frame, road markings, stripes, blurry, low quality, 3d render, perspective, shadow, object, people, cars, buildings, single object, kaleidoscope, swatch, sphere, cube"
+    },
+    {
+      "name": "tile",
+      "category": "walls",
+      "size": 256,
+      "seed": 920702,
+      "band": 0.04,
+      "subject": "seamless repeating tile of square ceramic wall tiles, muted turquoise, dark grout grid, flat colors",
+      "grade": { "saturation": 0.82, "warm": -0.3, "palette": 12 }
+    },
+    {
+      "name": "window_strip",
+      "category": "walls",
+      "size": 256,
+      "seed": 940511,
+      "band": 0.04,
+      "subject": "seamless repeating tile, teal tinted glass windows in metal frames, facade pattern, straight view",
+      "grade": { "saturation": 0.9, "warm": -0.3, "palette": 14 },
+      "negative": "text, letters, logo, watermark, seams, border, vignette, frame, road markings, stripes, blurry, low quality, 3d render, perspective, shadow, object, people, cars, buildings, single object, kaleidoscope, swatch, sphere, cube"
+    },
+    {
+      "name": "metal",
+      "category": "details",
+      "size": 256,
+      "seed": 940701,
+      "band": 0.04,
+      "subject": "seamless texture of painted steel panel with rivets, blue grey, scratches, material study",
+      "negative": "text, letters, logo, watermark, seams, border, vignette, frame, road markings, stripes, blurry, low quality, 3d render, perspective, shadow, object, people, cars, buildings, single object, kaleidoscope, swatch, sphere, cube"
+    },
+    {
+      "name": "wood",
+      "category": "details",
+      "size": 256,
+      "seed": 910006,
+      "band": 0.04,
+      "subject": "seamless repeating pattern of wooden planks, warm brown vertical boards, flat colors"
+    },
+    {
+      "name": "roof",
+      "category": "roofs",
+      "size": 512,
+      "seed": 950312,
+      "band": 0.10,
+      "subject": "dark grey tar roof surface with fine stones, top view, seamless background"
+    },
+    {
+      "name": "roof_metal",
+      "category": "roofs",
+      "size": 256,
+      "seed": 940401,
+      "band": 0.04,
+      "subject": "seamless texture of corrugated metal sheet, grey paint with rust, material study",
+      "negative": "text, letters, logo, watermark, seams, border, vignette, frame, road markings, stripes, blurry, low quality, 3d render, perspective, shadow, object, people, cars, buildings, single object, kaleidoscope, swatch, sphere, cube"
+    },
+    {
+      "name": "graffiti_panel",
+      "category": "decals",
+      "size": 512,
+      "seed": 921202,
+      "band": 0.08,
+      "subject": "abstract graffiti spray paint shapes on a concrete wall, bold cyan magenta and yellow blobs, flat colors",
+      "grade": { "saturation": 1.15, "warm": 0.0, "palette": 20, "grain": 0.004 }
+    },
+    {
+      "name": "poster",
+      "category": "decals",
+      "size": 512,
+      "seed": 921301,
+      "band": 0.08,
+      "subject": "retro poster artwork, abstract geometric shapes, sun disc and palm silhouette, orange and teal, flat colors, blank rectangles instead of letters",
+      "grade": { "saturation": 1.1, "warm": 0.3, "palette": 18, "grain": 0.004 }
+    }
+  ]
+}
